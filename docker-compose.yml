@@ -6,11 +6,10 @@ services:
     container_name: ebird-webhook-scraper
     ports:
       - "3000:3000"
+    env_file:
+      - .env
     environment:
       - NODE_ENV=production
-      - PORT=3000
-      - EBIRD_API_KEY=${EBIRD_API_KEY}
-      - EBIRD_DAYS_BACK=${EBIRD_DAYS_BACK:-1}
     volumes:
       - ebird-db:/app/data
     restart: unless-stopped
