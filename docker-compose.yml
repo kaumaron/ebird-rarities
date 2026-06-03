@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  ebird-webhook:
+    build: .
+    container_name: ebird-webhook-scraper
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - EBIRD_API_KEY=${EBIRD_API_KEY}
+      - EBIRD_DAYS_BACK=${EBIRD_DAYS_BACK:-1}
+    volumes:
+      - ebird-db:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 40s
+    # Optional: Add logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  ebird-db:
+    driver: local

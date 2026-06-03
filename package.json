@@ -1,0 +1,32 @@
+{
+  "name": "ebird-nj-webhook",
+  "version": "1.0.0",
+  "description": "Scrape NJ eBird county alerts daily and push via webhooks",
+  "main": "ebird-webhook-server.js",
+  "scripts": {
+    "start": "node ebird-webhook-server.js",
+    "dev": "nodemon ebird-webhook-server.js",
+    "test": "node test-webhook.js"
+  },
+  "keywords": [
+    "ebird",
+    "birding",
+    "webhooks",
+    "scraper"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "axios": "^1.6.2",
+    "cheerio": "^1.0.0-rc.12",
+    "node-cron": "^3.0.2",
+    "sqlite3": "^5.1.6"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
