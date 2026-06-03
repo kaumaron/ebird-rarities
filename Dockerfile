@@ -11,7 +11,6 @@ RUN npm install --production
 
 # Copy application files
 COPY ebird-webhook-server.js .
-COPY scraper-improved.js .
 
 # Create volume mount for database persistence
 VOLUME ["/app/data"]

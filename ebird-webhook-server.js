@@ -60,6 +60,27 @@ db.run(`
 const EBIRD_API_KEY = process.env.EBIRD_API_KEY;
 const EBIRD_DAYS_BACK = parseInt(process.env.EBIRD_DAYS_BACK || '1', 10);
 
+// Build Discord webhook map from env vars.
+// DISCORD_WEBHOOK_ALL -> all counties
+// DISCORD_WEBHOOK_CAPE_MAY -> Cape May, etc.
+function loadDiscordWebhooks() {
+  const map = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!key.startsWith('DISCORD_WEBHOOK_') || !value) continue;
+    const suffix = key.slice('DISCORD_WEBHOOK_'.length);
+    if (suffix === 'ALL') {
+      map['ALL'] = value;
+    } else {
+      // Convert CAPE_MAY -> Cape May
+      const county = suffix.split('_').map(w => w[0] + w.slice(1).toLowerCase()).join(' ');
+      map[county] = value;
+    }
+  }
+  return map;
+}
+
+const discordWebhooks = loadDiscordWebhooks();
+
 // NJ county names mapped to their eBird region codes (US-NJ-{FIPS})
 const njCounties = {
   'Atlantic':    'US-NJ-001',
@@ -257,8 +278,92 @@ async function sendWebhookNotifications(observations) {
   return failedWebhooks;
 }
 
+// Build a Discord embed for a single observation
+function buildEmbed(obs) {
+  const colors = { 'Confirmed': 0x2d6a4f, 'Unreviewed': 0xf0a500, 'Not Accepted': 0xc0392b };
+  const color = colors[obs.status] || 0x888888;
+
+  const fields = [
+    { name: 'County',   value: obs.county,            inline: true },
+    { name: 'Location', value: obs.location,           inline: true },
+    { name: 'Date',     value: obs.date,               inline: true },
+    { name: 'Observer', value: obs.observer,           inline: true },
+    { name: 'Count',    value: obs.count != null ? String(obs.count) : '—', inline: true },
+    { name: 'Status',   value: obs.status || 'Unknown', inline: true },
+  ];
+
+  const mediaParts = [];
+  if (obs.mediaPhotos > 0) mediaParts.push(`📷 ${obs.mediaPhotos}`);
+  if (obs.mediaAudio  > 0) mediaParts.push(`🔊 ${obs.mediaAudio}`);
+  if (obs.mediaVideo  > 0) mediaParts.push(`🎥 ${obs.mediaVideo}`);
+  if (mediaParts.length)   fields.push({ name: 'Media', value: mediaParts.join('  '), inline: true });
+
+  const embed = { title: obs.species, color, fields };
+  if (obs.scientificName) embed.description = `*${obs.scientificName}*`;
+  if (obs.speciesComment) embed.description = (embed.description ? embed.description + '\n' : '') + obs.speciesComment;
+  if (obs.subId) embed.url = `https://ebird.org/checklist/${obs.subId}`;
+
+  return embed;
+}
+
+// Post observations to Discord, batching up to 10 embeds per message
+async function postToDiscord(webhookUrl, observations) {
+  const BATCH = 10;
+  for (let i = 0; i < observations.length; i += BATCH) {
+    const batch = observations.slice(i, i + BATCH);
+    await axios.post(webhookUrl, {
+      username: 'NJ eBird Rarities',
+      embeds: batch.map(buildEmbed)
+    }, { timeout: 10000 });
+    if (i + BATCH < observations.length) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+  }
+}
+
+// Send Discord notifications — per-county webhooks + optional ALL webhook
+async function sendDiscordNotifications(newObservations) {
+  if (!Object.keys(discordWebhooks).length) return;
+
+  // Group by county
+  const byCounty = {};
+  for (const obs of newObservations) {
+    (byCounty[obs.county] = byCounty[obs.county] || []).push(obs);
+  }
+
+  // Per-county webhooks
+  for (const [county, observations] of Object.entries(byCounty)) {
+    const url = discordWebhooks[county];
+    if (!url) continue;
+    try {
+      await postToDiscord(url, observations);
+      console.log(`✓ Discord notified: ${county} (${observations.length} obs)`);
+    } catch (err) {
+      console.error(`✗ Discord failed for ${county}:`, err.message);
+    }
+  }
+
+  // ALL webhook gets everything in one go
+  const allUrl = discordWebhooks['ALL'];
+  if (allUrl && newObservations.length > 0) {
+    try {
+      await postToDiscord(allUrl, newObservations);
+      console.log(`✓ Discord ALL notified (${newObservations.length} obs)`);
+    } catch (err) {
+      console.error('✗ Discord ALL failed:', err.message);
+    }
+  }
+}
+
+let scrapeRunning = false;
+
 // Main scrape and notify function
 async function runDailyUpdate() {
+  if (scrapeRunning) {
+    console.log('Scrape already in progress, skipping.');
+    return;
+  }
+  scrapeRunning = true;
   console.log(`\n[${new Date().toISOString()}] Starting daily eBird alert scrape...`);
   
   try {
@@ -271,9 +376,12 @@ async function runDailyUpdate() {
 
     if (enriched.length > 0) {
       await sendWebhookNotifications(enriched);
+      await sendDiscordNotifications(enriched);
     }
   } catch (error) {
     console.error('Error during daily update:', error);
+  } finally {
+    scrapeRunning = false;
   }
 }
 
@@ -560,7 +668,7 @@ app.get('/health', (req, res) => {
 });
 
 // Schedule daily scrape at 6 AM
-cron.schedule('0 6 * * *', () => {
+cron.schedule('0 */6 * * *', () => {
   runDailyUpdate();
 });
 
