@@ -212,7 +212,7 @@ function storeObservations(observations) {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
-    let inserted = 0;
+    const newObservations = [];
     observations.forEach(obs => {
       stmt.run(
         [obs.county, obs.species, obs.speciesCode || null, obs.scientificName,
@@ -222,14 +222,14 @@ function storeObservations(observations) {
          obs.mediaPhotos || 0, obs.mediaAudio || 0, obs.mediaVideo || 0],
         function(err) {
           if (err) console.error('DB insert error:', err);
-          if (this.lastID) inserted++;
+          if (this.lastID) newObservations.push(obs);
         }
       );
     });
 
     stmt.finalize(err => {
       if (err) reject(err);
-      resolve(inserted);
+      resolve(newObservations);
     });
   });
 }
@@ -371,12 +371,12 @@ async function runDailyUpdate() {
     console.log(`Found ${observations.length} observations — fetching checklist details...`);
 
     const enriched = await enrichWithChecklistDetails(observations);
-    const inserted = await storeObservations(enriched);
-    console.log(`Stored ${inserted} new observations`);
+    const newObs = await storeObservations(enriched);
+    console.log(`Stored ${newObs.length} new observations`);
 
-    if (enriched.length > 0) {
-      await sendWebhookNotifications(enriched);
-      await sendDiscordNotifications(enriched);
+    if (newObs.length > 0) {
+      await sendWebhookNotifications(newObs);
+      await sendDiscordNotifications(newObs);
     }
   } catch (error) {
     console.error('Error during daily update:', error);
