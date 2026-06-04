@@ -11,7 +11,7 @@ services:
     environment:
       - NODE_ENV=production
     volumes:
-      - ebird-db:/app/data
+      - ./data:/app/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
@@ -26,6 +26,3 @@ services:
         max-size: "10m"
         max-file: "3"
 
-volumes:
-  ebird-db:
-    driver: local

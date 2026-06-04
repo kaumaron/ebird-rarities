@@ -7,7 +7,7 @@ yarn.lock
 *.db
 *.sqlite
 *.sqlite3
-ebird-webhooks.db
+data/
 
 # Logs
 logs/

@@ -8,7 +8,7 @@ const app = express();
 app.use(express.json());
 
 // Database setup
-const dbPath = path.join(__dirname, 'ebird-webhooks.db');
+const dbPath = path.join(__dirname, 'data', 'ebird-webhooks.db');
 const db = new sqlite3.Database(dbPath);
 
 // Initialize database
@@ -21,40 +21,76 @@ db.run(`
   )
 `);
 
-db.run(`
-  CREATE TABLE IF NOT EXISTS observations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    county TEXT NOT NULL,
-    species TEXT NOT NULL,
-    species_code TEXT,
-    scientific_name TEXT,
-    location TEXT NOT NULL,
-    location_id TEXT,
-    date TEXT NOT NULL,
-    observer TEXT NOT NULL,
-    count INTEGER,
-    lat REAL,
-    lng REAL,
-    reviewed INTEGER,
-    valid INTEGER,
-    status TEXT,
-    sub_id TEXT,
-    obs_id TEXT,
-    species_comment TEXT,
-    checklist_comment TEXT,
-    media_photos INTEGER DEFAULT 0,
-    media_audio INTEGER DEFAULT 0,
-    media_video INTEGER DEFAULT 0,
-    scrape_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(county, species, location_id, date, observer)
-  )
-`);
+// Migrate observations table to use sub_id + species_code as the unique key.
+// The old UNIQUE(county, species, location_id, date, observer) breaks because
+// SQLite treats each NULL as distinct, causing re-inserts every run.
+// We detect the old schema by reading the CREATE TABLE statement from sqlite_master.
+db.serialize(() => {
+  db.run(`
+    CREATE TABLE IF NOT EXISTS observations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      county TEXT NOT NULL,
+      species TEXT NOT NULL,
+      species_code TEXT,
+      scientific_name TEXT,
+      location TEXT NOT NULL,
+      location_id TEXT,
+      date TEXT NOT NULL,
+      observer TEXT NOT NULL,
+      count INTEGER,
+      lat REAL,
+      lng REAL,
+      reviewed INTEGER,
+      valid INTEGER,
+      status TEXT,
+      sub_id TEXT,
+      obs_id TEXT,
+      species_comment TEXT,
+      checklist_comment TEXT,
+      media_photos INTEGER DEFAULT 0,
+      media_audio INTEGER DEFAULT 0,
+      media_video INTEGER DEFAULT 0,
+      scrape_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(sub_id, species_code)
+    )
+  `);
 
-// Add new columns to existing databases that predate this schema
-['species_code TEXT', 'sub_id TEXT', 'obs_id TEXT', 'species_comment TEXT', 'checklist_comment TEXT',
- 'media_photos INTEGER DEFAULT 0', 'media_audio INTEGER DEFAULT 0', 'media_video INTEGER DEFAULT 0'
-].forEach(col => {
-  db.run(`ALTER TABLE observations ADD COLUMN ${col}`, () => {});
+  db.get(`SELECT sql FROM sqlite_master WHERE type='table' AND name='observations'`, (err, row) => {
+    if (!row || !row.sql || row.sql.includes('UNIQUE(sub_id, species_code)')) return;
+    console.log('Migrating observations table to new unique constraint...');
+    db.run(`ALTER TABLE observations RENAME TO observations_old`);
+    db.run(`
+      CREATE TABLE observations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        county TEXT NOT NULL,
+        species TEXT NOT NULL,
+        species_code TEXT,
+        scientific_name TEXT,
+        location TEXT NOT NULL,
+        location_id TEXT,
+        date TEXT NOT NULL,
+        observer TEXT NOT NULL,
+        count INTEGER,
+        lat REAL,
+        lng REAL,
+        reviewed INTEGER,
+        valid INTEGER,
+        status TEXT,
+        sub_id TEXT,
+        obs_id TEXT,
+        species_comment TEXT,
+        checklist_comment TEXT,
+        media_photos INTEGER DEFAULT 0,
+        media_audio INTEGER DEFAULT 0,
+        media_video INTEGER DEFAULT 0,
+        scrape_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(sub_id, species_code)
+      )
+    `);
+    db.run(`INSERT OR IGNORE INTO observations SELECT * FROM observations_old`);
+    db.run(`DROP TABLE observations_old`);
+    console.log('Migration complete.');
+  });
 });
 
 const EBIRD_API_KEY = process.env.EBIRD_API_KEY;
@@ -201,9 +237,29 @@ async function enrichWithChecklistDetails(observations) {
   });
 }
 
-// Store new observations in database
-function storeObservations(observations) {
-  return new Promise((resolve, reject) => {
+// Store new observations in database, returning only the ones actually inserted
+async function storeObservations(observations) {
+  if (observations.length === 0) return [];
+
+  // Pre-query which (sub_id, species_code) pairs already exist
+  const subIds = [...new Set(observations.map(o => o.subId).filter(Boolean))];
+  const existing = await new Promise((resolve, reject) => {
+    if (subIds.length === 0) return resolve(new Set());
+    const placeholders = subIds.map(() => '?').join(',');
+    db.all(
+      `SELECT sub_id, species_code FROM observations WHERE sub_id IN (${placeholders})`,
+      subIds,
+      (err, rows) => {
+        if (err) return reject(err);
+        resolve(new Set(rows.map(r => `${r.sub_id}:${r.species_code}`)));
+      }
+    );
+  });
+
+  const newObservations = observations.filter(o => !existing.has(`${o.subId}:${o.speciesCode}`));
+  if (newObservations.length === 0) return [];
+
+  await new Promise((resolve, reject) => {
     const stmt = db.prepare(`
       INSERT OR IGNORE INTO observations
       (county, species, species_code, scientific_name, location, location_id, date, observer,
@@ -212,26 +268,24 @@ function storeObservations(observations) {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
-    const newObservations = [];
-    observations.forEach(obs => {
+    newObservations.forEach(obs => {
       stmt.run(
         [obs.county, obs.species, obs.speciesCode || null, obs.scientificName,
          obs.location, obs.locationId, obs.date, obs.observer,
          obs.count, obs.lat, obs.lng, obs.reviewed ? 1 : 0, obs.valid ? 1 : 0, obs.status,
          obs.subId || null, obs.obsId || null, obs.speciesComment || null, obs.checklistComment || null,
          obs.mediaPhotos || 0, obs.mediaAudio || 0, obs.mediaVideo || 0],
-        function(err) {
-          if (err) console.error('DB insert error:', err);
-          if (this.lastID) newObservations.push(obs);
-        }
+        err => { if (err) console.error('DB insert error:', err); }
       );
     });
 
     stmt.finalize(err => {
       if (err) reject(err);
-      resolve(newObservations);
+      else resolve();
     });
   });
+
+  return newObservations;
 }
 
 // Get webhooks that should receive this update

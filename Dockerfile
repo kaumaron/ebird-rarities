@@ -12,7 +12,8 @@ RUN npm install --production
 # Copy application files
 COPY ebird-webhook-server.js .
 
-# Create volume mount for database persistence
+# Create data directory for persistent database
+RUN mkdir -p /app/data
 VOLUME ["/app/data"]
 
 # Expose port
