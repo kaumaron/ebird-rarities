@@ -96,26 +96,30 @@ db.serialize(() => {
 const EBIRD_API_KEY = process.env.EBIRD_API_KEY;
 const EBIRD_DAYS_BACK = parseInt(process.env.EBIRD_DAYS_BACK || '1', 10);
 
-// Build Discord webhook map from env vars.
-// DISCORD_WEBHOOK_ALL -> all counties
-// DISCORD_WEBHOOK_CAPE_MAY -> Cape May, etc.
-function loadDiscordWebhooks() {
-  const map = {};
+// Discord webhooks are stored in the DB and managed via the UI.
+// On first startup, seed from any DISCORD_WEBHOOK_* env vars so existing
+// configs carry over automatically.
+db.run(`
+  CREATE TABLE IF NOT EXISTS discord_webhooks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    county TEXT NOT NULL,
+    url TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
+db.get('SELECT COUNT(*) as count FROM discord_webhooks', (err, row) => {
+  if (err || row.count > 0) return;
   for (const [key, value] of Object.entries(process.env)) {
     if (!key.startsWith('DISCORD_WEBHOOK_') || !value) continue;
     const suffix = key.slice('DISCORD_WEBHOOK_'.length);
-    if (suffix === 'ALL') {
-      map['ALL'] = value;
-    } else {
-      // Convert CAPE_MAY -> Cape May
-      const county = suffix.split('_').map(w => w[0] + w.slice(1).toLowerCase()).join(' ');
-      map[county] = value;
-    }
+    const county = suffix === 'ALL' ? 'ALL'
+      : suffix.split('_').map(w => w[0] + w.slice(1).toLowerCase()).join(' ');
+    const name = `${county} (imported from env)`;
+    db.run('INSERT INTO discord_webhooks (name, county, url) VALUES (?, ?, ?)', [name, county, value]);
   }
-  return map;
-}
-
-const discordWebhooks = loadDiscordWebhooks();
+});
 
 // NJ county names mapped to their eBird region codes (US-NJ-{FIPS})
 const njCounties = {
@@ -355,7 +359,7 @@ function buildEmbed(obs) {
   const embed = { title: obs.species, color, fields };
   if (obs.scientificName) embed.description = `*${obs.scientificName}*`;
   if (obs.speciesComment) embed.description = (embed.description ? embed.description + '\n' : '') + obs.speciesComment;
-  if (obs.subId) embed.url = `https://ebird.org/checklist/${obs.subId}`;
+  if (obs.subId) embed.url = `https://ebird.org/checklist/${obs.subId}${obs.obsId ? '#' + obs.obsId : ''}`;
 
   return embed;
 }
@@ -375,36 +379,29 @@ async function postToDiscord(webhookUrl, observations) {
   }
 }
 
-// Send Discord notifications — per-county webhooks + optional ALL webhook
+// Send Discord notifications — queries DB for webhooks each run so UI changes
+// take effect immediately. Multiple webhooks per county are each posted to independently.
 async function sendDiscordNotifications(newObservations) {
-  if (!Object.keys(discordWebhooks).length) return;
+  const webhooks = await new Promise((resolve, reject) => {
+    db.all('SELECT * FROM discord_webhooks', (err, rows) => {
+      if (err) reject(err); else resolve(rows);
+    });
+  });
+  if (!webhooks.length) return;
 
-  // Group by county
   const byCounty = {};
   for (const obs of newObservations) {
     (byCounty[obs.county] = byCounty[obs.county] || []).push(obs);
   }
 
-  // Per-county webhooks
-  for (const [county, observations] of Object.entries(byCounty)) {
-    const url = discordWebhooks[county];
-    if (!url) continue;
+  for (const webhook of webhooks) {
+    const observations = webhook.county === 'ALL' ? newObservations : (byCounty[webhook.county] || []);
+    if (!observations.length) continue;
     try {
-      await postToDiscord(url, observations);
-      console.log(`✓ Discord notified: ${county} (${observations.length} obs)`);
+      await postToDiscord(webhook.url, observations);
+      console.log(`✓ Discord [${webhook.name}]: ${observations.length} obs`);
     } catch (err) {
-      console.error(`✗ Discord failed for ${county}:`, err.message);
-    }
-  }
-
-  // ALL webhook gets everything in one go
-  const allUrl = discordWebhooks['ALL'];
-  if (allUrl && newObservations.length > 0) {
-    try {
-      await postToDiscord(allUrl, newObservations);
-      console.log(`✓ Discord ALL notified (${newObservations.length} obs)`);
-    } catch (err) {
-      console.error('✗ Discord ALL failed:', err.message);
+      console.error(`✗ Discord [${webhook.name}]: ${err.message}`);
     }
   }
 }
@@ -522,20 +519,191 @@ app.get('/counties', (req, res) => {
   res.json(Object.keys(njCounties).sort());
 });
 
-// Observations browser UI
-app.get('/', (req, res) => {
-  res.send(`<!DOCTYPE html>
+// List Discord webhooks
+app.get('/discord-webhooks', (req, res) => {
+  db.all('SELECT * FROM discord_webhooks ORDER BY county, name', (err, rows) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    res.json(rows);
+  });
+});
+
+// Add a Discord webhook
+app.post('/discord-webhooks', (req, res) => {
+  const { name, county, url } = req.body;
+  if (!name || !county || !url) return res.status(400).json({ error: 'name, county, and url are required' });
+  db.run(
+    'INSERT INTO discord_webhooks (name, county, url) VALUES (?, ?, ?)',
+    [name, county, url],
+    function(err) {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      res.json({ id: this.lastID, name, county, url });
+    }
+  );
+});
+
+// Delete a Discord webhook
+app.delete('/discord-webhooks/:id', (req, res) => {
+  db.run('DELETE FROM discord_webhooks WHERE id = ?', [req.params.id], function(err) {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (this.changes === 0) return res.status(404).json({ error: 'Not found' });
+    res.json({ message: 'Deleted', id: req.params.id });
+  });
+});
+
+// Shared header/nav HTML
+function pageShell(title, activeHref, bodyHtml) {
+  return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>NJ eBird Rarities</title>
+  <title>${title} — NJ eBird Rarities</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: system-ui, sans-serif; background: #f5f5f5; color: #222; }
     header { background: #2d6a4f; color: white; padding: 16px 24px; display: flex; align-items: center; gap: 16px; }
     header h1 { font-size: 1.25rem; font-weight: 600; }
-    header span { font-size: 0.85rem; opacity: 0.8; }
+    header h1 a { color: inherit; text-decoration: none; }
+    header nav { margin-left: auto; display: flex; gap: 8px; }
+    header nav a { color: rgba(255,255,255,0.85); text-decoration: none; font-size: 0.85rem; padding: 4px 12px; border: 1px solid rgba(255,255,255,0.4); border-radius: 4px; }
+    header nav a:hover, header nav a.active { background: rgba(255,255,255,0.2); color: white; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1><a href="/">NJ eBird Rarities</a></h1>
+    <span id="last-updated" style="font-size:0.8rem;opacity:0.7;margin-left:12px"></span>
+    <nav>
+      <a href="/" ${activeHref === '/' ? 'class="active"' : ''}>Observations</a>
+      <a href="/settings" ${activeHref === '/settings' ? 'class="active"' : ''}>Discord Webhooks</a>
+    </nav>
+  </header>
+  ${bodyHtml}
+</body>
+</html>`;
+}
+
+// Discord Webhooks settings page
+app.get('/settings', async (req, res) => {
+  res.send(pageShell('Discord Webhooks', '/settings', `
+  <style>
+    .page { max-width: 900px; margin: 32px auto; padding: 0 24px; }
+    h2 { font-size: 1.1rem; font-weight: 600; margin-bottom: 16px; color: #2d6a4f; }
+    .add-form { background: white; border-radius: 6px; padding: 20px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+    .add-form .fields { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+    .add-form label { font-size: 0.8rem; color: #555; display: flex; flex-direction: column; gap: 4px; }
+    .add-form input, .add-form select { padding: 7px 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 0.9rem; }
+    .add-form input.url-input { width: 340px; }
+    .add-form button { padding: 7px 20px; background: #2d6a4f; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 0.9rem; }
+    .add-form button:hover { background: #1b4332; }
+    #form-status { margin-top: 10px; font-size: 0.85rem; }
+    #form-status.error { color: #c0392b; }
+    #form-status.ok { color: #2d6a4f; }
+    .wh-list { background: white; border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); overflow: hidden; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
+    thead th { background: #2d6a4f; color: white; text-align: left; padding: 10px 14px; }
+    tbody tr { border-bottom: 1px solid #eee; }
+    tbody tr:hover { background: #f9f9f9; }
+    td { padding: 10px 14px; vertical-align: middle; }
+    .url-cell { font-family: monospace; font-size: 0.78rem; color: #555; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .county-badge { background: #e8f5e9; color: #1b4332; padding: 2px 10px; border-radius: 10px; font-size: 0.75rem; font-weight: 600; }
+    .county-badge.all { background: #e3f2fd; color: #0d47a1; }
+    .btn-delete { background: none; border: 1px solid #dc3545; color: #dc3545; padding: 3px 12px; border-radius: 4px; cursor: pointer; font-size: 0.8rem; }
+    .btn-delete:hover { background: #dc3545; color: white; }
+    .empty { padding: 32px; text-align: center; color: #888; }
+  </style>
+  <div class="page">
+    <h2>Add Webhook</h2>
+    <div class="add-form">
+      <div class="fields">
+        <label>Name / Description
+          <input id="wh-name" type="text" placeholder="e.g. NJ Birders #essex" style="width:200px">
+        </label>
+        <label>County
+          <select id="wh-county">
+            <option value="ALL">ALL counties</option>
+          </select>
+        </label>
+        <label>Discord Webhook URL
+          <input id="wh-url" type="url" class="url-input" placeholder="https://discord.com/api/webhooks/...">
+        </label>
+        <button onclick="addWebhook()">Add</button>
+      </div>
+      <div id="form-status"></div>
+    </div>
+
+    <h2>Configured Webhooks</h2>
+    <div class="wh-list">
+      <table>
+        <thead><tr><th>Name</th><th>County</th><th>URL</th><th></th></tr></thead>
+        <tbody id="wh-tbody"><tr><td colspan="4" class="empty">Loading...</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+  <script>
+    function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+    async function loadCounties() {
+      const counties = await (await fetch('/counties')).json();
+      const sel = document.getElementById('wh-county');
+      counties.forEach(c => {
+        const o = document.createElement('option'); o.value = c; o.textContent = c; sel.appendChild(o);
+      });
+    }
+
+    async function loadWebhooks() {
+      const rows = await (await fetch('/discord-webhooks')).json();
+      const tbody = document.getElementById('wh-tbody');
+      if (!rows.length) {
+        tbody.innerHTML = '<tr><td colspan="4" class="empty">No webhooks configured yet.</td></tr>';
+        return;
+      }
+      tbody.innerHTML = rows.map(w =>
+        '<tr>' +
+        '<td>' + esc(w.name) + '</td>' +
+        '<td><span class="county-badge' + (w.county==='ALL'?' all':'') + '">' + esc(w.county) + '</span></td>' +
+        '<td class="url-cell" title="' + esc(w.url) + '">' + esc(w.url) + '</td>' +
+        '<td><button class="btn-delete" onclick="deleteWebhook(' + w.id + ')">Delete</button></td>' +
+        '</tr>'
+      ).join('');
+    }
+
+    async function addWebhook() {
+      const name   = document.getElementById('wh-name').value.trim();
+      const county = document.getElementById('wh-county').value;
+      const url    = document.getElementById('wh-url').value.trim();
+      const status = document.getElementById('form-status');
+      if (!name || !url) { status.className='error'; status.textContent='Name and URL are required.'; return; }
+      const res = await fetch('/discord-webhooks', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ name, county, url })
+      });
+      if (res.ok) {
+        document.getElementById('wh-name').value = '';
+        document.getElementById('wh-url').value = '';
+        status.className='ok'; status.textContent='Webhook added.';
+        setTimeout(() => status.textContent='', 3000);
+        loadWebhooks();
+      } else {
+        status.className='error'; status.textContent='Failed to add webhook.';
+      }
+    }
+
+    async function deleteWebhook(id) {
+      if (!confirm('Delete this webhook?')) return;
+      await fetch('/discord-webhooks/' + id, { method: 'DELETE' });
+      loadWebhooks();
+    }
+
+    loadCounties();
+    loadWebhooks();
+  </script>`));
+});
+
+// Observations browser UI
+app.get('/', (req, res) => {
+  res.send(pageShell('Observations', '/', `
+  <style>
     .controls { display: flex; flex-wrap: wrap; gap: 12px; padding: 16px 24px; background: white; border-bottom: 1px solid #ddd; align-items: flex-end; }
     .controls label { font-size: 0.8rem; color: #555; display: flex; flex-direction: column; gap: 4px; }
     .controls select, .controls input { padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 0.9rem; }
@@ -565,12 +733,6 @@ app.get('/', (req, res) => {
     .media-links a { font-size: 0.75rem; color: #2d6a4f; text-decoration: none; background: #e8f5e9; padding: 1px 6px; border-radius: 10px; }
     .media-links a:hover { background: #c8e6c9; }
   </style>
-</head>
-<body>
-  <header>
-    <h1>NJ eBird Rarities</h1>
-    <span id="last-updated"></span>
-  </header>
   <div class="controls">
     <label>County
       <select id="county-filter">
@@ -705,9 +867,7 @@ app.get('/', (req, res) => {
 
     loadCounties();
     loadObservations();
-  </script>
-</body>
-</html>`);
+  </script>`));
 });
 
 // Manually trigger a scrape (for testing)
