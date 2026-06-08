@@ -882,7 +882,7 @@ app.get('/health', (req, res) => {
 });
 
 // Schedule daily scrape at 6 AM
-cron.schedule('0 4,10,16,22 * * *', () => {
+cron.schedule('0 * * * *', () => {
   runDailyUpdate();
 });
 
