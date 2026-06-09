@@ -93,8 +93,23 @@ db.serialize(() => {
   });
 });
 
-const EBIRD_API_KEY = process.env.EBIRD_API_KEY;
-const EBIRD_DAYS_BACK = parseInt(process.env.EBIRD_DAYS_BACK || '1', 10);
+// Secrets are loaded from AWS Secrets Manager if AWS_SECRET_NAME is set,
+// then merged into process.env before anything reads them.
+async function loadAWSSecrets() {
+  const secretName = process.env.AWS_SECRET_NAME;
+  if (!secretName) return;
+  try {
+    const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
+    const client = new SecretsManagerClient({ region: process.env.AWS_REGION || 'us-east-1' });
+    const response = await client.send(new GetSecretValueCommand({ SecretId: secretName }));
+    const secrets = JSON.parse(response.SecretString);
+    Object.assign(process.env, secrets);
+    console.log(`Loaded ${Object.keys(secrets).length} secrets from AWS Secrets Manager (${secretName})`);
+  } catch (err) {
+    console.error('Failed to load AWS secrets:', err.message);
+    process.exit(1);
+  }
+}
 
 // Discord webhooks are stored in the DB and managed via the UI.
 // On first startup, seed from any DISCORD_WEBHOOK_* env vars so existing
@@ -148,14 +163,14 @@ const njCounties = {
 
 // Fetch notable observations for a single county via the eBird API
 async function fetchCountyNotable(county, regionCode) {
-  if (!EBIRD_API_KEY) {
-    throw new Error('EBIRD_API_KEY environment variable is not set');
-  }
+  const apiKey = process.env.EBIRD_API_KEY;
+  const daysBack = parseInt(process.env.EBIRD_DAYS_BACK || '1', 10);
+  if (!apiKey) throw new Error('EBIRD_API_KEY is not set');
 
   const url = `https://api.ebird.org/v2/data/obs/${regionCode}/recent/notable`;
   const response = await axios.get(url, {
-    headers: { 'X-eBirdApiToken': EBIRD_API_KEY },
-    params: { back: EBIRD_DAYS_BACK, detail: 'full' },
+    headers: { 'X-eBirdApiToken': apiKey },
+    params: { back: daysBack, detail: 'full' },
     timeout: 15000
   });
 
@@ -886,10 +901,13 @@ cron.schedule('0 * * * *', () => {
   runDailyUpdate();
 });
 
-// Also run on startup
-setTimeout(() => {
-  runDailyUpdate();
-}, 5000);
+// Load secrets then run startup scrape
+loadAWSSecrets().then(() => {
+  setTimeout(() => runDailyUpdate(), 5000);
+}).catch(err => {
+  console.error('Startup failed:', err);
+  process.exit(1);
+});
 
 // Start server
 const PORT = process.env.PORT || 3000;
