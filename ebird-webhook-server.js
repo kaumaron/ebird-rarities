@@ -1,4 +1,5 @@
 const express = require('express');
+const session = require('express-session');
 const cron = require('node-cron');
 const axios = require('axios');
 const sqlite3 = require('sqlite3').verbose();
@@ -6,6 +7,52 @@ const path = require('path');
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
+app.use(session({
+  secret: process.env.SESSION_SECRET || 'ebird-session-secret',
+  resave: false,
+  saveUninitialized: false,
+  cookie: { maxAge: 8 * 60 * 60 * 1000 } // 8 hours
+}));
+
+function requireAuth(req, res, next) {
+  if (req.session.authenticated) return next();
+  res.redirect('/login');
+}
+
+app.get('/login', (req, res) => {
+  const error = req.query.error ? '<p style="color:#e05c5c;margin:0 0 12px">Incorrect password.</p>' : '';
+  res.send(`<!DOCTYPE html><html><head><title>Login</title><style>
+    body{font-family:sans-serif;background:#1a1a2e;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+    .box{background:#16213e;padding:32px;border-radius:8px;width:280px}
+    h2{color:#e2e8f0;margin:0 0 20px;font-size:1.2rem}
+    input{width:100%;padding:8px 10px;border-radius:4px;border:1px solid #2d3748;background:#0f3460;color:#e2e8f0;font-size:1rem;box-sizing:border-box}
+    button{margin-top:12px;width:100%;padding:9px;background:#3b82f6;color:#fff;border:none;border-radius:4px;font-size:1rem;cursor:pointer}
+    button:hover{background:#2563eb}
+  </style></head><body><div class="box">
+    <h2>eBird Admin</h2>${error}
+    <form method="POST" action="/login">
+      <input type="password" name="password" placeholder="Password" autofocus>
+      <button type="submit">Sign in</button>
+    </form>
+  </div></body></html>`);
+});
+
+app.post('/login', (req, res) => {
+  const adminPassword = process.env.ADMIN_PASSWORD;
+  if (!adminPassword) return res.redirect('/login?error=1');
+  if (req.body.password === adminPassword) {
+    req.session.authenticated = true;
+    res.redirect('/settings');
+  } else {
+    res.redirect('/login?error=1');
+  }
+});
+
+app.post('/logout', (req, res) => {
+  req.session.destroy();
+  res.redirect('/login');
+});
 
 // Database setup
 const dbPath = path.join(__dirname, 'data', 'ebird-webhooks.db');
@@ -217,7 +264,7 @@ async function scrapeAllCounties() {
 // Fetch a single checklist's details
 async function fetchChecklistDetails(subId) {
   const response = await axios.get(`https://api.ebird.org/v2/product/checklist/view/${subId}`, {
-    headers: { 'X-eBirdApiToken': EBIRD_API_KEY },
+    headers: { 'X-eBirdApiToken': process.env.EBIRD_API_KEY },
     timeout: 15000
   });
   return response.data;
@@ -543,7 +590,7 @@ app.get('/discord-webhooks', (req, res) => {
 });
 
 // Add a Discord webhook
-app.post('/discord-webhooks', (req, res) => {
+app.post('/discord-webhooks', requireAuth, (req, res) => {
   const { name, county, url } = req.body;
   if (!name || !county || !url) return res.status(400).json({ error: 'name, county, and url are required' });
   db.run(
@@ -557,7 +604,7 @@ app.post('/discord-webhooks', (req, res) => {
 });
 
 // Delete a Discord webhook
-app.delete('/discord-webhooks/:id', (req, res) => {
+app.delete('/discord-webhooks/:id', requireAuth, (req, res) => {
   db.run('DELETE FROM discord_webhooks WHERE id = ?', [req.params.id], function(err) {
     if (err) return res.status(500).json({ error: 'Database error' });
     if (this.changes === 0) return res.status(404).json({ error: 'Not found' });
@@ -566,7 +613,7 @@ app.delete('/discord-webhooks/:id', (req, res) => {
 });
 
 // Shared header/nav HTML
-function pageShell(title, activeHref, bodyHtml) {
+function pageShell(title, activeHref, bodyHtml, authenticated) {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -590,8 +637,9 @@ function pageShell(title, activeHref, bodyHtml) {
     <span id="last-updated" style="font-size:0.8rem;opacity:0.7;margin-left:12px"></span>
     <nav>
       <a href="/" ${activeHref === '/' ? 'class="active"' : ''}>Observations</a>
-      <a href="/settings" ${activeHref === '/settings' ? 'class="active"' : ''}>Discord Webhooks</a>
+      ${authenticated ? `<a href="/settings" ${activeHref === '/settings' ? 'class="active"' : ''}>Discord Webhooks</a>` : ''}
     </nav>
+    ${authenticated ? `<form method="POST" action="/logout" style="margin:0"><button type="submit" style="background:none;border:1px solid rgba(255,255,255,0.3);color:#e2e8f0;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:0.8rem">Logout</button></form>` : ''}
   </header>
   ${bodyHtml}
 </body>
@@ -599,7 +647,7 @@ function pageShell(title, activeHref, bodyHtml) {
 }
 
 // Discord Webhooks settings page
-app.get('/settings', async (req, res) => {
+app.get('/settings', requireAuth, async (req, res) => {
   res.send(pageShell('Discord Webhooks', '/settings', `
   <style>
     .page { max-width: 900px; margin: 32px auto; padding: 0 24px; }
@@ -712,7 +760,7 @@ app.get('/settings', async (req, res) => {
 
     loadCounties();
     loadWebhooks();
-  </script>`));
+  </script>`, true));
 });
 
 // Observations browser UI
@@ -882,7 +930,7 @@ app.get('/', (req, res) => {
 
     loadCounties();
     loadObservations();
-  </script>`));
+  </script>`, !!req.session.authenticated));
 });
 
 // Manually trigger a scrape (for testing)
