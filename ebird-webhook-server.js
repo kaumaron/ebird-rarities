@@ -765,6 +765,7 @@ app.get('/settings', requireAuth, async (req, res) => {
 
 // Observations browser UI
 app.get('/', (req, res) => {
+  const authenticated = !!req.session.authenticated;
   res.send(pageShell('Observations', '/', `
   <style>
     .controls { display: flex; flex-wrap: wrap; gap: 12px; padding: 16px 24px; background: white; border-bottom: 1px solid #ddd; align-items: flex-end; }
@@ -809,7 +810,7 @@ app.get('/', (req, res) => {
       <input type="number" id="limit-filter" value="200" min="1" max="1000" style="width:80px">
     </label>
     <button onclick="loadObservations()">Filter</button>
-    <button class="secondary" onclick="triggerScrape()">Fetch now</button>
+    ${authenticated ? `<button class="secondary" onclick="triggerScrape()">Fetch now</button>` : ''}
   </div>
   <div id="status">Loading...</div>
   <div class="table-wrap">
@@ -934,7 +935,7 @@ app.get('/', (req, res) => {
 });
 
 // Manually trigger a scrape (for testing)
-app.post('/scrape-now', async (req, res) => {
+app.post('/scrape-now', requireAuth, async (req, res) => {
   res.json({ message: 'Scrape started in background' });
   runDailyUpdate().catch(console.error);
 });
