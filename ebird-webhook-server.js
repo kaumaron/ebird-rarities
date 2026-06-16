@@ -817,13 +817,13 @@ app.get('/', (req, res) => {
     <table>
       <thead>
         <tr>
-          <th>Species</th>
-          <th>County</th>
+          <th data-col="species">Species</th>
+          <th data-col="county">County</th>
           <th>Location</th>
-          <th>Date</th>
-          <th>Observer</th>
-          <th>Count</th>
-          <th>Status</th>
+          <th data-col="date">Date</th>
+          <th data-col="observer">Observer</th>
+          <th data-col="count">Count</th>
+          <th data-col="status">Status</th>
           <th>Notes &amp; Media</th>
         </tr>
       </thead>
@@ -831,6 +831,34 @@ app.get('/', (req, res) => {
     </table>
   </div>
   <script>
+    let allRows = [];
+    let sortCol = 'date';
+    let sortAsc = false;
+
+    document.querySelector('thead tr').addEventListener('click', e => {
+      const th = e.target.closest('th[data-col]');
+      if (!th) return;
+      const col = th.dataset.col;
+      if (sortCol === col) {
+        sortAsc = !sortAsc;
+      } else {
+        sortCol = col;
+        sortAsc = true;
+      }
+      updateSortIndicators();
+      renderTable(allRows);
+    });
+
+    function updateSortIndicators() {
+      document.querySelectorAll('thead th').forEach(th => {
+        th.style.cursor = th.dataset.col ? 'pointer' : '';
+        const base = th.textContent.replace(/ [▲▼]$/, '');
+        th.textContent = th.dataset.col === sortCol
+          ? base + (sortAsc ? ' ▲' : ' ▼')
+          : base;
+      });
+    }
+
     async function loadCounties() {
       const res = await fetch('/counties');
       const counties = await res.json();
@@ -857,9 +885,10 @@ app.get('/', (req, res) => {
 
       try {
         const res = await fetch('/observations?' + params);
-        const rows = await res.json();
-        renderTable(rows);
-        status.textContent = rows.length + ' observation' + (rows.length !== 1 ? 's' : '') + ' — last loaded ' + new Date().toLocaleTimeString();
+        allRows = await res.json();
+        updateSortIndicators();
+        renderTable(allRows);
+        status.textContent = allRows.length + ' observation' + (allRows.length !== 1 ? 's' : '') + ' — last loaded ' + new Date().toLocaleTimeString();
         document.getElementById('last-updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
       } catch (e) {
         status.className = 'error';
@@ -868,6 +897,13 @@ app.get('/', (req, res) => {
     }
 
     function renderTable(rows) {
+      const sorted = [...rows].sort((a, b) => {
+        let av = a[sortCol], bv = b[sortCol];
+        if (sortCol === 'count') { av = av ?? -1; bv = bv ?? -1; }
+        else { av = (av || '').toLowerCase(); bv = (bv || '').toLowerCase(); }
+        return (av < bv ? -1 : av > bv ? 1 : 0) * (sortAsc ? 1 : -1);
+      });
+      rows = sorted;
       const tbody = document.getElementById('obs-body');
       if (rows.length === 0) {
         tbody.innerHTML = '<tr><td colspan="8" class="empty">No observations found for the selected filters.</td></tr>';
