@@ -556,8 +556,10 @@ app.delete('/webhooks/:id', (req, res) => {
 });
 
 // Get recent observations
+const MEDIA_COLUMNS = { photo: 'media_photos', audio: 'media_audio', video: 'media_video' };
+
 app.get('/observations', (req, res) => {
-  const { county, limit = 50, hours = 24, species } = req.query;
+  const { county, limit = 50, hours = 24, species, media } = req.query;
 
   let query = 'SELECT * FROM observations WHERE scrape_timestamp > datetime(\'now\', ?)';
   const params = [`-${hours} hours`];
@@ -572,6 +574,13 @@ app.get('/observations', (req, res) => {
     if (speciesList.length > 0) {
       query += ` AND species IN (${speciesList.map(() => '?').join(',')})`;
       params.push(...speciesList);
+    }
+  }
+
+  if (media) {
+    const mediaList = (Array.isArray(media) ? media : [media]).filter(m => MEDIA_COLUMNS[m]);
+    if (mediaList.length > 0) {
+      query += ` AND (${mediaList.map(m => `${MEDIA_COLUMNS[m]} > 0`).join(' OR ')})`;
     }
   }
 
@@ -796,6 +805,9 @@ app.get('/', (req, res) => {
     .species-tag { display: inline-flex; align-items: center; gap: 4px; background: #e8f5e9; color: #1b4332; padding: 2px 6px 2px 10px; border-radius: 10px; font-size: 0.78rem; }
     .species-tag button { background: none; border: none; color: #1b4332; cursor: pointer; font-size: 0.9rem; line-height: 1; padding: 0 2px; }
     .species-tag button:hover { color: #c0392b; }
+    .media-toggle-group { display: flex; gap: 10px; padding: 6px 0; }
+    .media-toggle-group label { flex-direction: row; align-items: center; gap: 4px; font-size: 0.85rem; color: #333; }
+    .media-toggle-group input { padding: 0; }
     #status { padding: 10px 24px; font-size: 0.85rem; color: #555; background: white; border-bottom: 1px solid #eee; }
     #status.error { color: #c0392b; }
     table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
@@ -840,6 +852,13 @@ app.get('/', (req, res) => {
       <input type="text" id="species-input" list="species-list" placeholder="Type to add a species..." style="width:220px">
       <datalist id="species-list"></datalist>
       <div class="species-tags" id="species-tags"></div>
+    </label>
+    <label>Media
+      <div class="media-toggle-group">
+        <label><input type="checkbox" class="media-filter" value="photo"> 📷 Photo</label>
+        <label><input type="checkbox" class="media-filter" value="audio"> 🔊 Audio</label>
+        <label><input type="checkbox" class="media-filter" value="video"> 🎥 Video</label>
+      </div>
     </label>
     <button onclick="loadObservations()">Filter</button>
     ${authenticated ? `<button class="secondary" onclick="triggerScrape()">Fetch now</button>` : ''}
@@ -917,6 +936,10 @@ app.get('/', (req, res) => {
       if (params.has('limit')) document.getElementById('limit-filter').value = params.get('limit');
       selectedSpecies = params.getAll('species');
       renderSpeciesTags();
+      const selectedMedia = params.getAll('media');
+      document.querySelectorAll('.media-filter').forEach(cb => {
+        cb.checked = selectedMedia.includes(cb.value);
+      });
     }
 
     document.querySelector('thead tr').addEventListener('click', e => {
@@ -969,6 +992,7 @@ app.get('/', (req, res) => {
       const params = new URLSearchParams({ hours, limit });
       if (county) params.set('county', county);
       selectedSpecies.forEach(s => params.append('species', s));
+      document.querySelectorAll('.media-filter:checked').forEach(cb => params.append('media', cb.value));
 
       history.replaceState(null, '', window.location.pathname + '?' + params.toString());
 
