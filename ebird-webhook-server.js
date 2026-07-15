@@ -557,7 +557,7 @@ app.delete('/webhooks/:id', (req, res) => {
 
 // Get recent observations
 app.get('/observations', (req, res) => {
-  const { county, limit = 50, hours = 24 } = req.query;
+  const { county, limit = 50, hours = 24, species } = req.query;
 
   let query = 'SELECT * FROM observations WHERE scrape_timestamp > datetime(\'now\', ?)';
   const params = [`-${hours} hours`];
@@ -565,6 +565,14 @@ app.get('/observations', (req, res) => {
   if (county) {
     query += ' AND county = ?';
     params.push(county);
+  }
+
+  if (species) {
+    const speciesList = Array.isArray(species) ? species : [species];
+    if (speciesList.length > 0) {
+      query += ` AND species IN (${speciesList.map(() => '?').join(',')})`;
+      params.push(...speciesList);
+    }
   }
 
   query += ' ORDER BY scrape_timestamp DESC LIMIT ?';
@@ -579,6 +587,14 @@ app.get('/observations', (req, res) => {
 // Get list of counties
 app.get('/counties', (req, res) => {
   res.json(Object.keys(njCounties).sort());
+});
+
+// Get list of distinct species currently in the database
+app.get('/species', (req, res) => {
+  db.all('SELECT DISTINCT species FROM observations ORDER BY species', (err, rows) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    res.json(rows.map(r => r.species));
+  });
 });
 
 // List Discord webhooks
@@ -775,6 +791,11 @@ app.get('/', (req, res) => {
     .controls button:hover { background: #1b4332; }
     .controls button.secondary { background: #6c757d; }
     .controls button.secondary:hover { background: #495057; }
+    .species-filter { position: relative; }
+    .species-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; max-width: 260px; }
+    .species-tag { display: inline-flex; align-items: center; gap: 4px; background: #e8f5e9; color: #1b4332; padding: 2px 6px 2px 10px; border-radius: 10px; font-size: 0.78rem; }
+    .species-tag button { background: none; border: none; color: #1b4332; cursor: pointer; font-size: 0.9rem; line-height: 1; padding: 0 2px; }
+    .species-tag button:hover { color: #c0392b; }
     #status { padding: 10px 24px; font-size: 0.85rem; color: #555; background: white; border-bottom: 1px solid #eee; }
     #status.error { color: #c0392b; }
     table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
@@ -803,11 +824,22 @@ app.get('/', (req, res) => {
         <option value="">All counties</option>
       </select>
     </label>
-    <label>Hours back
-      <input type="number" id="hours-filter" value="24" min="1" max="720" style="width:80px">
+    <label>Time back
+      <div style="display:flex; gap:4px">
+        <input type="number" id="time-filter" value="24" min="1" style="width:70px">
+        <select id="time-unit">
+          <option value="hours">Hours</option>
+          <option value="days">Days</option>
+        </select>
+      </div>
     </label>
     <label>Max results
       <input type="number" id="limit-filter" value="200" min="1" max="1000" style="width:80px">
+    </label>
+    <label class="species-filter">Species
+      <input type="text" id="species-input" list="species-list" placeholder="Type to add a species..." style="width:220px">
+      <datalist id="species-list"></datalist>
+      <div class="species-tags" id="species-tags"></div>
     </label>
     <button onclick="loadObservations()">Filter</button>
     ${authenticated ? `<button class="secondary" onclick="triggerScrape()">Fetch now</button>` : ''}
@@ -834,6 +866,58 @@ app.get('/', (req, res) => {
     let allRows = [];
     let sortCol = 'date';
     let sortAsc = false;
+    let allSpecies = [];
+    let selectedSpecies = [];
+
+    async function loadSpeciesList() {
+      const res = await fetch('/species');
+      allSpecies = await res.json();
+      const list = document.getElementById('species-list');
+      list.innerHTML = allSpecies.map(s => '<option value="' + escHtml(s) + '">').join('');
+    }
+
+    function renderSpeciesTags() {
+      const container = document.getElementById('species-tags');
+      container.innerHTML = selectedSpecies.map((s, i) =>
+        '<span class="species-tag">' + escHtml(s) +
+        '<button type="button" onclick="removeSpecies(' + i + ')" aria-label="Remove">&times;</button></span>'
+      ).join('');
+    }
+
+    function addSpeciesFromInput() {
+      const input = document.getElementById('species-input');
+      const val = input.value.trim();
+      if (!val) return;
+      const match = allSpecies.find(s => s.toLowerCase() === val.toLowerCase());
+      if (match && !selectedSpecies.includes(match)) {
+        selectedSpecies.push(match);
+        renderSpeciesTags();
+      }
+      input.value = '';
+    }
+
+    function removeSpecies(i) {
+      selectedSpecies.splice(i, 1);
+      renderSpeciesTags();
+    }
+
+    function applyFiltersFromUrl() {
+      const params = new URLSearchParams(window.location.search);
+      if (params.has('county')) document.getElementById('county-filter').value = params.get('county');
+      if (params.has('hours')) {
+        const hours = parseInt(params.get('hours'), 10);
+        if (hours % 24 === 0) {
+          document.getElementById('time-filter').value = hours / 24;
+          document.getElementById('time-unit').value = 'days';
+        } else {
+          document.getElementById('time-filter').value = hours;
+          document.getElementById('time-unit').value = 'hours';
+        }
+      }
+      if (params.has('limit')) document.getElementById('limit-filter').value = params.get('limit');
+      selectedSpecies = params.getAll('species');
+      renderSpeciesTags();
+    }
 
     document.querySelector('thead tr').addEventListener('click', e => {
       const th = e.target.closest('th[data-col]');
@@ -873,7 +957,9 @@ app.get('/', (req, res) => {
 
     async function loadObservations() {
       const county = document.getElementById('county-filter').value;
-      const hours = document.getElementById('hours-filter').value;
+      const timeValue = document.getElementById('time-filter').value;
+      const timeUnit = document.getElementById('time-unit').value;
+      const hours = timeUnit === 'days' ? timeValue * 24 : timeValue;
       const limit = document.getElementById('limit-filter').value;
       const status = document.getElementById('status');
 
@@ -882,6 +968,9 @@ app.get('/', (req, res) => {
 
       const params = new URLSearchParams({ hours, limit });
       if (county) params.set('county', county);
+      selectedSpecies.forEach(s => params.append('species', s));
+
+      history.replaceState(null, '', window.location.pathname + '?' + params.toString());
 
       try {
         const res = await fetch('/observations?' + params);
@@ -965,8 +1054,16 @@ app.get('/', (req, res) => {
       }
     }
 
-    loadCounties();
-    loadObservations();
+    document.getElementById('species-input').addEventListener('change', addSpeciesFromInput);
+    document.getElementById('species-input').addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); addSpeciesFromInput(); }
+    });
+
+    (async function init() {
+      await Promise.all([loadCounties(), loadSpeciesList()]);
+      applyFiltersFromUrl();
+      loadObservations();
+    })();
   </script>`, !!req.session.authenticated));
 });
 
