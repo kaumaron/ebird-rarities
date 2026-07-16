@@ -303,7 +303,10 @@ async function enrichWithChecklistDetails(observations) {
   });
 }
 
-// Store new observations in database, returning only the ones actually inserted
+// Store new observations in database, returning only the ones actually inserted.
+// Observations already in the DB get their media counts refreshed in place
+// (e.g. photos added to a checklist after the initial scrape) without being
+// treated as new for notification purposes.
 async function storeObservations(observations) {
   if (observations.length === 0) return [];
 
@@ -323,6 +326,24 @@ async function storeObservations(observations) {
   });
 
   const newObservations = observations.filter(o => !existing.has(`${o.subId}:${o.speciesCode}`));
+  const existingObservations = observations.filter(o => existing.has(`${o.subId}:${o.speciesCode}`));
+
+  if (existingObservations.length > 0) {
+    await new Promise((resolve, reject) => {
+      const stmt = db.prepare(`
+        UPDATE observations SET media_photos = ?, media_audio = ?, media_video = ?
+        WHERE sub_id = ? AND species_code = ?
+      `);
+      existingObservations.forEach(obs => {
+        stmt.run(
+          [obs.mediaPhotos || 0, obs.mediaAudio || 0, obs.mediaVideo || 0, obs.subId, obs.speciesCode],
+          err => { if (err) console.error('DB update error:', err); }
+        );
+      });
+      stmt.finalize(err => { if (err) reject(err); else resolve(); });
+    });
+  }
+
   if (newObservations.length === 0) return [];
 
   await new Promise((resolve, reject) => {
