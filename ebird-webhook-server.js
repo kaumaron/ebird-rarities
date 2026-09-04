@@ -97,8 +97,31 @@ db.serialize(() => {
       media_photos INTEGER DEFAULT 0,
       media_audio INTEGER DEFAULT 0,
       media_video INTEGER DEFAULT 0,
+      source TEXT DEFAULT 'notable',
+      confirmed INTEGER DEFAULT 1,
       scrape_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(sub_id, species_code)
+    )
+  `);
+
+  // Add source/confirmed to pre-existing DBs that predate the fast-pass feature.
+  db.all(`PRAGMA table_info(observations)`, (err, columns) => {
+    if (err) return console.error('Failed to inspect observations schema:', err);
+    const names = columns.map(c => c.name);
+    if (!names.includes('source')) {
+      db.run(`ALTER TABLE observations ADD COLUMN source TEXT DEFAULT 'notable'`);
+    }
+    if (!names.includes('confirmed')) {
+      db.run(`ALTER TABLE observations ADD COLUMN confirmed INTEGER DEFAULT 1`);
+    }
+  });
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS county_species (
+      county TEXT NOT NULL,
+      species_code TEXT NOT NULL,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(county, species_code)
     )
   `);
 
@@ -130,11 +153,22 @@ db.serialize(() => {
         media_photos INTEGER DEFAULT 0,
         media_audio INTEGER DEFAULT 0,
         media_video INTEGER DEFAULT 0,
+        source TEXT DEFAULT 'notable',
+        confirmed INTEGER DEFAULT 1,
         scrape_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(sub_id, species_code)
       )
     `);
-    db.run(`INSERT OR IGNORE INTO observations SELECT * FROM observations_old`);
+    db.run(`
+      INSERT OR IGNORE INTO observations
+      (id, county, species, species_code, scientific_name, location, location_id, date, observer,
+       count, lat, lng, reviewed, valid, status, sub_id, obs_id, species_comment, checklist_comment,
+       media_photos, media_audio, media_video, scrape_timestamp)
+      SELECT id, county, species, species_code, scientific_name, location, location_id, date, observer,
+       count, lat, lng, reviewed, valid, status, sub_id, obs_id, species_comment, checklist_comment,
+       media_photos, media_audio, media_video, scrape_timestamp
+      FROM observations_old
+    `);
     db.run(`DROP TABLE observations_old`);
     console.log('Migration complete.');
   });
@@ -261,6 +295,126 @@ async function scrapeAllCounties() {
   return allObservations;
 }
 
+// Per-county set of species codes ever reported there (from eBird's own spplist),
+// used as a cheap "is this expected at all" baseline for the fast pass. Not a
+// substitute for eBird's real notable/rarity filters — just a coarse pre-filter.
+const expectedSpeciesCache = {};
+
+function loadExpectedSpeciesCacheFromDB() {
+  return new Promise((resolve, reject) => {
+    db.all('SELECT county, species_code FROM county_species', (err, rows) => {
+      if (err) return reject(err);
+      for (const row of rows) {
+        if (!expectedSpeciesCache[row.county]) expectedSpeciesCache[row.county] = new Set();
+        expectedSpeciesCache[row.county].add(row.species_code);
+      }
+      resolve();
+    });
+  });
+}
+
+// Refresh each county's all-time species list from eBird. Species lists change
+// slowly (new county records are rare), so this only needs to run daily.
+async function refreshCountySpeciesList() {
+  const apiKey = process.env.EBIRD_API_KEY;
+  if (!apiKey) throw new Error('EBIRD_API_KEY is not set');
+
+  for (const [county, regionCode] of Object.entries(njCounties)) {
+    try {
+      const response = await axios.get(`https://api.ebird.org/v2/product/spplist/${regionCode}`, {
+        headers: { 'X-eBirdApiToken': apiKey },
+        timeout: 15000
+      });
+      const codes = response.data;
+      expectedSpeciesCache[county] = new Set(codes);
+
+      await new Promise((resolve, reject) => {
+        db.serialize(() => {
+          db.run('DELETE FROM county_species WHERE county = ?', [county]);
+          const stmt = db.prepare('INSERT OR IGNORE INTO county_species (county, species_code) VALUES (?, ?)');
+          codes.forEach(code => stmt.run([county, code]));
+          stmt.finalize(err => (err ? reject(err) : resolve()));
+        });
+      });
+      console.log(`✓ Species baseline refreshed for ${county}: ${codes.length} species`);
+    } catch (error) {
+      console.error(`✗ Failed to refresh species baseline for ${county}:`, error.message);
+    }
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
+}
+
+// NJ's local calendar date (checklists are dated locally; using UTC could be off by a day)
+function getNJDateParts() {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', year: 'numeric', month: 'numeric', day: 'numeric'
+  }).formatToParts(new Date());
+  const map = {};
+  for (const p of parts) map[p.type] = p.value;
+  return { y: map.year, m: map.month, d: map.day };
+}
+
+// Fetch every observation reported today for a county, regardless of eBird's
+// notable classification — this is what makes the fast pass fast, since new
+// checklists show up here within minutes of submission.
+async function fetchCountyHistoricToday(county, regionCode) {
+  const apiKey = process.env.EBIRD_API_KEY;
+  if (!apiKey) throw new Error('EBIRD_API_KEY is not set');
+
+  const { y, m, d } = getNJDateParts();
+  const url = `https://api.ebird.org/v2/data/obs/${regionCode}/historic/${y}/${m}/${d}`;
+  const response = await axios.get(url, {
+    headers: { 'X-eBirdApiToken': apiKey },
+    params: { detail: 'full' },
+    timeout: 15000
+  });
+
+  return response.data.map(obs => ({
+    county,
+    species: obs.comName,
+    speciesCode: obs.speciesCode,
+    scientificName: obs.sciName,
+    location: obs.locName,
+    locationId: obs.locId,
+    date: obs.obsDt,
+    observer: obs.userDisplayName || 'Unknown',
+    count: obs.howMany || null,
+    lat: obs.lat,
+    lng: obs.lng,
+    reviewed: obs.obsReviewed,
+    valid: obs.obsValid,
+    status: obs.obsReviewed ? (obs.obsValid ? 'Confirmed' : 'Not Accepted') : 'Unreviewed',
+    subId: obs.subId || null
+  }));
+}
+
+// Scan today's observations across all NJ counties and return only the ones
+// for species not on that county's known-species baseline — rough rarity
+// candidates the slower official notable pass will later confirm or dismiss.
+async function scrapeFastPassCandidates() {
+  const candidates = [];
+
+  for (const [county, regionCode] of Object.entries(njCounties)) {
+    const expected = expectedSpeciesCache[county];
+    if (!expected || expected.size === 0) {
+      console.warn(`Fast pass: no species baseline for ${county} yet, skipping`);
+      await new Promise(resolve => setTimeout(resolve, 200));
+      continue;
+    }
+    try {
+      const observations = await fetchCountyHistoricToday(county, regionCode);
+      const unexpected = observations.filter(o => o.speciesCode && !expected.has(o.speciesCode));
+      candidates.push(...unexpected);
+      console.log(`✓ Fast pass ${county}: ${unexpected.length} unexpected of ${observations.length} total`);
+    } catch (error) {
+      console.error(`✗ Fast pass error fetching ${county}:`, error.message);
+    }
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
+
+  return candidates;
+}
+
 // Fetch a single checklist's details
 async function fetchChecklistDetails(subId) {
   const response = await axios.get(`https://api.ebird.org/v2/product/checklist/view/${subId}`, {
@@ -329,14 +483,25 @@ async function storeObservations(observations) {
   const existingObservations = observations.filter(o => existing.has(`${o.subId}:${o.speciesCode}`));
 
   if (existingObservations.length > 0) {
+    // A later notable-pass sighting of something the fast pass already flagged
+    // promotes it to confirmed and refreshes its review status, without
+    // duplicating the record or re-notifying.
     await new Promise((resolve, reject) => {
       const stmt = db.prepare(`
-        UPDATE observations SET media_photos = ?, media_audio = ?, media_video = ?
+        UPDATE observations SET media_photos = ?, media_audio = ?, media_video = ?,
+          confirmed = CASE WHEN ? = 'notable' THEN 1 ELSE confirmed END,
+          reviewed = CASE WHEN ? = 'notable' THEN ? ELSE reviewed END,
+          valid = CASE WHEN ? = 'notable' THEN ? ELSE valid END,
+          status = CASE WHEN ? = 'notable' THEN ? ELSE status END
         WHERE sub_id = ? AND species_code = ?
       `);
       existingObservations.forEach(obs => {
         stmt.run(
-          [obs.mediaPhotos || 0, obs.mediaAudio || 0, obs.mediaVideo || 0, obs.subId, obs.speciesCode],
+          [obs.mediaPhotos || 0, obs.mediaAudio || 0, obs.mediaVideo || 0,
+           obs.source, obs.source, obs.reviewed ? 1 : 0,
+           obs.source, obs.source, obs.valid ? 1 : 0,
+           obs.source, obs.source, obs.status,
+           obs.subId, obs.speciesCode],
           err => { if (err) console.error('DB update error:', err); }
         );
       });
@@ -351,8 +516,9 @@ async function storeObservations(observations) {
       INSERT OR IGNORE INTO observations
       (county, species, species_code, scientific_name, location, location_id, date, observer,
        count, lat, lng, reviewed, valid, status,
-       sub_id, obs_id, species_comment, checklist_comment, media_photos, media_audio, media_video)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       sub_id, obs_id, species_comment, checklist_comment, media_photos, media_audio, media_video,
+       source, confirmed)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     newObservations.forEach(obs => {
@@ -361,7 +527,8 @@ async function storeObservations(observations) {
          obs.location, obs.locationId, obs.date, obs.observer,
          obs.count, obs.lat, obs.lng, obs.reviewed ? 1 : 0, obs.valid ? 1 : 0, obs.status,
          obs.subId || null, obs.obsId || null, obs.speciesComment || null, obs.checklistComment || null,
-         obs.mediaPhotos || 0, obs.mediaAudio || 0, obs.mediaVideo || 0],
+         obs.mediaPhotos || 0, obs.mediaAudio || 0, obs.mediaVideo || 0,
+         obs.source || 'notable', (obs.source === 'fast' && !obs.confirmed) ? 0 : 1],
         err => { if (err) console.error('DB insert error:', err); }
       );
     });
@@ -422,7 +589,8 @@ async function sendWebhookNotifications(observations) {
 // Build a Discord embed for a single observation
 function buildEmbed(obs) {
   const colors = { 'Confirmed': 0x2d6a4f, 'Unreviewed': 0xf0a500, 'Not Accepted': 0xc0392b };
-  const color = colors[obs.status] || 0x888888;
+  const isUnconfirmedFast = obs.source === 'fast' && !obs.confirmed;
+  const color = isUnconfirmedFast ? 0x8e44ad : (colors[obs.status] || 0x888888);
 
   const fields = [
     { name: 'County',   value: obs.county,            inline: true },
@@ -431,6 +599,7 @@ function buildEmbed(obs) {
     { name: 'Observer', value: obs.observer,           inline: true },
     { name: 'Count',    value: obs.count != null ? String(obs.count) : '—', inline: true },
     { name: 'Status',   value: obs.status || 'Unknown', inline: true },
+    { name: 'Source',   value: isUnconfirmedFast ? '⚡ Fast pass (unconfirmed)' : '✓ eBird notable', inline: true },
   ];
 
   const mediaParts = [];
@@ -490,8 +659,10 @@ async function sendDiscordNotifications(newObservations) {
 }
 
 let scrapeRunning = false;
+let fastPassRunning = false;
 
-// Main scrape and notify function
+// Main scrape and notify function — the authoritative pass, driven by eBird's
+// own notable/rarity filters. Runs on the hour.
 async function runDailyUpdate() {
   if (scrapeRunning) {
     console.log('Scrape already in progress, skipping.');
@@ -499,13 +670,14 @@ async function runDailyUpdate() {
   }
   scrapeRunning = true;
   console.log(`\n[${new Date().toISOString()}] Starting daily eBird alert scrape...`);
-  
+
   try {
     const observations = await scrapeAllCounties();
     console.log(`Found ${observations.length} observations — fetching checklist details...`);
 
     const enriched = await enrichWithChecklistDetails(observations);
-    const newObs = await storeObservations(enriched);
+    const tagged = enriched.map(o => ({ ...o, source: 'notable', confirmed: true }));
+    const newObs = await storeObservations(tagged);
     console.log(`Stored ${newObs.length} new observations`);
 
     if (newObs.length > 0) {
@@ -516,6 +688,45 @@ async function runDailyUpdate() {
     console.error('Error during daily update:', error);
   } finally {
     scrapeRunning = false;
+  }
+}
+
+// Fast pass — runs at the half-hour mark, well ahead of the next notable pass.
+// Uses today's raw checklist observations (available within minutes of
+// submission) filtered against each county's known-species baseline, so it
+// can flag likely rarities before eBird's own notable classification catches
+// up. Anything it misses is still caught by the next runDailyUpdate — delayed,
+// not missed. Anything it flags gets promoted to confirmed once the notable
+// pass corroborates it (see storeObservations).
+async function runFastPass() {
+  if (fastPassRunning) {
+    console.log('Fast pass already in progress, skipping.');
+    return;
+  }
+  if (scrapeRunning) {
+    console.log('Notable scrape in progress, skipping fast pass this cycle.');
+    return;
+  }
+  fastPassRunning = true;
+  console.log(`\n[${new Date().toISOString()}] Starting fast-pass checklist scrape...`);
+
+  try {
+    const candidates = await scrapeFastPassCandidates();
+    console.log(`Fast pass found ${candidates.length} unexpected-species candidates — fetching checklist details...`);
+
+    const enriched = await enrichWithChecklistDetails(candidates);
+    const tagged = enriched.map(o => ({ ...o, source: 'fast', confirmed: false }));
+    const newObs = await storeObservations(tagged);
+    console.log(`Fast pass stored ${newObs.length} new candidate observations`);
+
+    if (newObs.length > 0) {
+      await sendWebhookNotifications(newObs);
+      await sendDiscordNotifications(newObs);
+    }
+  } catch (error) {
+    console.error('Error during fast pass:', error);
+  } finally {
+    fastPassRunning = false;
   }
 }
 
@@ -842,6 +1053,9 @@ app.get('/', (req, res) => {
     .badge.confirmed { background: #d4edda; color: #155724; }
     .badge.unreviewed { background: #fff3cd; color: #856404; }
     .badge.not-accepted { background: #f8d7da; color: #721c24; }
+    .badge.fast-unconfirmed { background: #f3e5f5; color: #6a1b9a; }
+    .badge.fast-confirmed { background: #e8f5e9; color: #1b4332; }
+    .badge.source-ebird { background: #e3f2fd; color: #0d47a1; }
     .empty { text-align: center; padding: 48px; color: #888; }
     .table-wrap { overflow-x: auto; }
     a.map-link { color: #2d6a4f; text-decoration: none; font-size: 0.8rem; }
@@ -883,6 +1097,7 @@ app.get('/', (req, res) => {
     </label>
     <button onclick="loadObservations()">Filter</button>
     ${authenticated ? `<button class="secondary" onclick="triggerScrape()">Fetch now</button>` : ''}
+    ${authenticated ? `<button class="secondary" onclick="triggerFastPass()">Fast pass now</button>` : ''}
   </div>
   <div id="status">Loading...</div>
   <div class="table-wrap">
@@ -896,6 +1111,7 @@ app.get('/', (req, res) => {
           <th data-col="observer">Observer</th>
           <th data-col="count">Count</th>
           <th data-col="status">Status</th>
+          <th data-col="source">Source</th>
           <th>Notes &amp; Media</th>
         </tr>
       </thead>
@@ -1040,7 +1256,7 @@ app.get('/', (req, res) => {
       rows = sorted;
       const tbody = document.getElementById('obs-body');
       if (rows.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="8" class="empty">No observations found for the selected filters.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="9" class="empty">No observations found for the selected filters.</td></tr>';
         return;
       }
       tbody.innerHTML = rows.map(r => {
@@ -1069,6 +1285,12 @@ app.get('/', (req, res) => {
           ? '<div class="media-links">' + mediaLinks.join('') + '</div>'
           : '';
 
+        const sourceBadge = r.source === 'fast'
+          ? (r.confirmed
+              ? '<span class="badge fast-confirmed" title="Flagged by the fast pass, since confirmed by eBird notable feed">⚡ Fast (confirmed)</span>'
+              : '<span class="badge fast-unconfirmed" title="Flagged by the fast pass; eBird notable feed has not corroborated it yet">⚡ Fast (unconfirmed)</span>')
+          : '<span class="badge source-ebird" title="From eBird notable/rarity feed">eBird notable</span>';
+
         return '<tr>' +
           '<td class="species">' + escHtml(r.species) + '<br><span class="sci">' + escHtml(r.scientific_name || '') + '</span></td>' +
           '<td>' + escHtml(r.county) + '</td>' +
@@ -1077,6 +1299,7 @@ app.get('/', (req, res) => {
           '<td>' + escHtml(r.observer) + '</td>' +
           '<td>' + (r.count != null ? r.count : '—') + '</td>' +
           '<td><span class="badge ' + badgeClass + '">' + escHtml(r.status) + '</span></td>' +
+          '<td>' + sourceBadge + '</td>' +
           '<td>' + comment + mediaCell + '</td>' +
           '</tr>';
       }).join('');
@@ -1099,6 +1322,19 @@ app.get('/', (req, res) => {
       }
     }
 
+    async function triggerFastPass() {
+      const status = document.getElementById('status');
+      status.textContent = 'Running fast pass...';
+      try {
+        await fetch('/scrape-fast-now', { method: 'POST' });
+        status.textContent = 'Fast pass started — reloading in 20 seconds...';
+        setTimeout(loadObservations, 20000);
+      } catch (e) {
+        status.className = 'error';
+        status.textContent = 'Error triggering fast pass: ' + e.message;
+      }
+    }
+
     document.getElementById('species-input').addEventListener('change', addSpeciesFromInput);
     document.getElementById('species-input').addEventListener('keydown', e => {
       if (e.key === 'Enter') { e.preventDefault(); addSpeciesFromInput(); }
@@ -1118,18 +1354,40 @@ app.post('/scrape-now', requireAuth, async (req, res) => {
   runDailyUpdate().catch(console.error);
 });
 
+// Manually trigger a fast pass (for testing)
+app.post('/scrape-fast-now', requireAuth, async (req, res) => {
+  res.json({ message: 'Fast pass started in background' });
+  runFastPass().catch(console.error);
+});
+
 // Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Schedule daily scrape at 6 AM
+// Authoritative notable-based scrape, on the hour
 cron.schedule('0 * * * *', () => {
   runDailyUpdate();
 });
 
-// Load secrets then run startup scrape
-loadAWSSecrets().then(() => {
+// Fast pass, at the half-hour mark — a quick pre-filter that the next
+// hourly pass above double-checks and confirms
+cron.schedule('30 * * * *', () => {
+  runFastPass();
+});
+
+// Refresh each county's known-species baseline once a day
+cron.schedule('15 3 * * *', () => {
+  refreshCountySpeciesList();
+});
+
+// Load secrets, make sure a species baseline exists, then run startup scrape
+loadAWSSecrets().then(async () => {
+  await loadExpectedSpeciesCacheFromDB();
+  if (Object.keys(expectedSpeciesCache).length === 0) {
+    console.log('No species baseline found — building one from eBird before first run...');
+    await refreshCountySpeciesList();
+  }
   setTimeout(() => runDailyUpdate(), 5000);
 }).catch(err => {
   console.error('Startup failed:', err);
