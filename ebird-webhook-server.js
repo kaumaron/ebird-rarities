@@ -1391,15 +1391,6 @@ cron.schedule('15 3 * * *', () => {
   refreshCountySpeciesList();
 });
 
-// Make sure a species baseline exists, then run startup scrape
-// (secrets are already loaded at this point)
-await loadExpectedSpeciesCacheFromDB();
-if (Object.keys(expectedSpeciesCache).length === 0) {
-  console.log('No species baseline found — building one from eBird before first run...');
-  await refreshCountySpeciesList();
-}
-setTimeout(() => runDailyUpdate(), 5000);
-
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
@@ -1409,6 +1400,18 @@ app.listen(PORT, () => {
   console.log(`Get observations: GET /observations`);
   console.log(`Get counties: GET /counties`);
 });
+
+// Make sure a species baseline exists, then run startup scrape.
+// Runs in the background so /health responds as soon as the server is
+// listening, without waiting on eBird's spplist calls for all 21 counties.
+(async () => {
+  await loadExpectedSpeciesCacheFromDB();
+  if (Object.keys(expectedSpeciesCache).length === 0) {
+    console.log('No species baseline found — building one from eBird before first run...');
+    await refreshCountySpeciesList();
+  }
+  setTimeout(() => runDailyUpdate(), 5000);
+})().catch(err => console.error('Startup background task failed:', err));
 
 // Graceful shutdown
 process.on('SIGINT', () => {
