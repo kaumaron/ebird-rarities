@@ -5,11 +5,15 @@ const axios = require('axios');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 
+if (!process.env.SESSION_SECRET) {
+  throw new Error('SESSION_SECRET must be set (used to sign session cookies)');
+}
+
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use(session({
-  secret: process.env.SESSION_SECRET || 'ebird-session-secret',
+  secret: process.env.SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
   cookie: { maxAge: 8 * 60 * 60 * 1000 } // 8 hours
@@ -522,7 +526,7 @@ async function runDailyUpdate() {
 // REST API Endpoints
 
 // Register a webhook
-app.post('/webhooks/register', (req, res) => {
+app.post('/webhooks/register', requireAuth, (req, res) => {
   const { url, counties } = req.body;
 
   if (!url) {
@@ -549,7 +553,7 @@ app.post('/webhooks/register', (req, res) => {
 });
 
 // List all registered webhooks
-app.get('/webhooks', (req, res) => {
+app.get('/webhooks', requireAuth, (req, res) => {
   db.all('SELECT id, url, counties, created_at FROM webhooks', (err, rows) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     
@@ -565,7 +569,7 @@ app.get('/webhooks', (req, res) => {
 });
 
 // Remove a webhook
-app.delete('/webhooks/:id', (req, res) => {
+app.delete('/webhooks/:id', requireAuth, (req, res) => {
   const { id } = req.params;
 
   db.run('DELETE FROM webhooks WHERE id = ?', [id], function(err) {
@@ -628,7 +632,7 @@ app.get('/species', (req, res) => {
 });
 
 // List Discord webhooks
-app.get('/discord-webhooks', (req, res) => {
+app.get('/discord-webhooks', requireAuth, (req, res) => {
   db.all('SELECT * FROM discord_webhooks ORDER BY county, name', (err, rows) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     res.json(rows);

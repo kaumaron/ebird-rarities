@@ -26,7 +26,7 @@ All configuration is via environment variables. Copy `.env.example` to `.env` an
 |---|---|---|
 | `EBIRD_API_KEY` | *(required)* | Your eBird API key |
 | `ADMIN_PASSWORD` | *(required)* | Password for the `/settings` admin panel |
-| `SESSION_SECRET` | *(recommended)* | Random string for signing session cookies |
+| `SESSION_SECRET` | *(required)* | Random string for signing session cookies |
 | `PORT` | `3000` | HTTP port |
 | `EBIRD_DAYS_BACK` | `1` | Days back to fetch notable obs (1–30) |
 | `SCRAPE_SCHEDULE` | `0 * * * *` | Cron schedule (default: hourly) |
