@@ -5,9 +5,15 @@ const axios = require('axios');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 
-if (!process.env.SESSION_SECRET) {
-  throw new Error('SESSION_SECRET must be set (used to sign session cookies)');
-}
+// Everything below runs inside main() so it only executes after
+// loadAWSSecrets() has populated process.env — session middleware and the
+// Discord-webhook env seeding below both need real values, not undefined.
+async function main() {
+  await loadAWSSecrets();
+
+  if (!process.env.SESSION_SECRET) {
+    throw new Error('SESSION_SECRET must be set (used to sign session cookies)');
+  }
 
 const app = express();
 app.use(express.json());
@@ -1132,13 +1138,8 @@ cron.schedule('0 * * * *', () => {
   runDailyUpdate();
 });
 
-// Load secrets then run startup scrape
-loadAWSSecrets().then(() => {
-  setTimeout(() => runDailyUpdate(), 5000);
-}).catch(err => {
-  console.error('Startup failed:', err);
-  process.exit(1);
-});
+// Run startup scrape (secrets are already loaded at this point)
+setTimeout(() => runDailyUpdate(), 5000);
 
 // Start server
 const PORT = process.env.PORT || 3000;
@@ -1154,4 +1155,10 @@ app.listen(PORT, () => {
 process.on('SIGINT', () => {
   db.close();
   process.exit(0);
+});
+}
+
+main().catch(err => {
+  console.error('Startup failed:', err);
+  process.exit(1);
 });
