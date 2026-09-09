@@ -940,6 +940,7 @@ function pageShell(title, activeHref, bodyHtml, authenticated) {
     <nav>
       <a href="/" ${activeHref === '/' ? 'class="active"' : ''}>Observations</a>
       ${authenticated ? `<a href="/settings" ${activeHref === '/settings' ? 'class="active"' : ''}>Discord Webhooks</a>` : ''}
+      ${authenticated ? `<a href="/stats" ${activeHref === '/stats' ? 'class="active"' : ''}>Fast-Pass Stats</a>` : ''}
     </nav>
     ${authenticated ? `<form method="POST" action="/logout" style="margin:0"><button type="submit" style="background:none;border:1px solid rgba(255,255,255,0.3);color:#e2e8f0;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:0.8rem">Logout</button></form>` : ''}
   </header>
@@ -1062,6 +1063,139 @@ app.get('/settings', requireAuth, async (req, res) => {
 
     loadCounties();
     loadWebhooks();
+  </script>`, true));
+});
+
+// Fast-pass efficacy stats — aggregated over the full lifetime of the
+// observations table (fast_pass_flagged_at/confirmed_at never get cleared),
+// so this reflects how the feature has performed since it was deployed,
+// not just a recent window.
+app.get('/stats/fast-pass', requireAuth, (req, res) => {
+  const totalsSql = `
+    SELECT
+      MIN(fast_pass_flagged_at) AS since,
+      COUNT(*) AS candidates,
+      SUM(CASE WHEN confirmed = 1 THEN 1 ELSE 0 END) AS promoted,
+      SUM(CASE WHEN confirmed = 0 THEN 1 ELSE 0 END) AS unconfirmed,
+      AVG(CASE WHEN confirmed_at IS NOT NULL
+            THEN (julianday(confirmed_at) - julianday(fast_pass_flagged_at)) * 1440
+            ELSE NULL END) AS avgLeadMinutes
+    FROM observations WHERE source = 'fast'
+  `;
+  const byCountySql = `
+    SELECT
+      county,
+      COUNT(*) AS candidates,
+      SUM(CASE WHEN confirmed = 1 THEN 1 ELSE 0 END) AS promoted,
+      SUM(CASE WHEN confirmed = 0 THEN 1 ELSE 0 END) AS unconfirmed,
+      AVG(CASE WHEN confirmed_at IS NOT NULL
+            THEN (julianday(confirmed_at) - julianday(fast_pass_flagged_at)) * 1440
+            ELSE NULL END) AS avgLeadMinutes
+    FROM observations WHERE source = 'fast'
+    GROUP BY county ORDER BY candidates DESC
+  `;
+  const recentSql = `
+    SELECT species, county, date, status, confirmed, fast_pass_flagged_at AS flaggedAt, confirmed_at AS confirmedAt
+    FROM observations WHERE source = 'fast'
+    ORDER BY fast_pass_flagged_at DESC LIMIT 50
+  `;
+
+  db.get(totalsSql, [], (err, totals) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    db.all(byCountySql, [], (err, byCounty) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      db.all(recentSql, [], (err, recent) => {
+        if (err) return res.status(500).json({ error: 'Database error' });
+        const withLead = recent.map(r => ({
+          ...r,
+          leadMinutes: r.confirmedAt
+            ? Math.round((new Date(r.confirmedAt).getTime() - new Date(r.flaggedAt).getTime()) / 60000)
+            : null
+        }));
+        res.json({ totals, byCounty, recent: withLead });
+      });
+    });
+  });
+});
+
+// Fast-pass stats admin page
+app.get('/stats', requireAuth, (req, res) => {
+  res.send(pageShell('Fast-Pass Stats', '/stats', `
+  <style>
+    .page { max-width: 1000px; margin: 32px auto; padding: 0 24px; }
+    h2 { font-size: 1.1rem; font-weight: 600; margin: 24px 0 12px; color: #2d6a4f; }
+    h2:first-child { margin-top: 0; }
+    .cards { display: flex; gap: 16px; flex-wrap: wrap; }
+    .card { background: white; border-radius: 6px; padding: 16px 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); min-width: 140px; }
+    .card .num { font-size: 1.6rem; font-weight: 700; color: #1b4332; }
+    .card .label { font-size: 0.8rem; color: #666; margin-top: 4px; }
+    .since { font-size: 0.85rem; color: #666; margin-bottom: 16px; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.875rem; background: white; border-radius: 6px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+    thead th { background: #2d6a4f; color: white; text-align: left; padding: 8px 12px; }
+    tbody tr { border-bottom: 1px solid #eee; }
+    tbody tr:hover { background: #f9f9f9; }
+    td { padding: 8px 12px; }
+    .badge { padding: 2px 8px; border-radius: 10px; font-size: 0.75rem; font-weight: 600; }
+    .badge.promoted { background: #e8f5e9; color: #1b4332; }
+    .badge.unconfirmed { background: #f3e5f5; color: #6a1b9a; }
+    .empty { padding: 32px; text-align: center; color: #888; }
+  </style>
+  <div class="page">
+    <h2>Overview</h2>
+    <div class="since" id="since"></div>
+    <div class="cards" id="cards"></div>
+
+    <h2>By County</h2>
+    <table>
+      <thead><tr><th>County</th><th>Candidates</th><th>Promoted</th><th>Unconfirmed</th><th>Avg Lead Time</th></tr></thead>
+      <tbody id="county-tbody"><tr><td colspan="5" class="empty">Loading...</td></tr></tbody>
+    </table>
+
+    <h2>Recent Candidates</h2>
+    <table>
+      <thead><tr><th>Species</th><th>County</th><th>Date</th><th>Status</th><th>Outcome</th><th>Lead Time</th></tr></thead>
+      <tbody id="recent-tbody"><tr><td colspan="6" class="empty">Loading...</td></tr></tbody>
+    </table>
+  </div>
+  <script>
+    function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+    function fmtMinutes(m) {
+      if (m == null) return '—';
+      if (m < 60) return m + ' min';
+      return (m / 60).toFixed(1) + ' hr';
+    }
+
+    async function loadStats() {
+      const data = await (await fetch('/stats/fast-pass')).json();
+      const t = data.totals;
+
+      document.getElementById('since').textContent = t.since
+        ? 'Tracking since ' + new Date(t.since).toLocaleDateString()
+        : 'No fast-pass candidates recorded yet.';
+
+      const rate = t.candidates ? Math.round((t.promoted / t.candidates) * 100) : 0;
+      document.getElementById('cards').innerHTML = [
+        ['Total Candidates', t.candidates || 0],
+        ['Promoted', t.promoted || 0],
+        ['Still Unconfirmed', t.unconfirmed || 0],
+        ['Promotion Rate', rate + '%'],
+        ['Avg Lead Time', fmtMinutes(t.avgLeadMinutes)]
+      ].map(([label, num]) => '<div class="card"><div class="num">' + num + '</div><div class="label">' + label + '</div></div>').join('');
+
+      const countyTbody = document.getElementById('county-tbody');
+      countyTbody.innerHTML = data.byCounty.length ? data.byCounty.map(c =>
+        '<tr><td>' + esc(c.county) + '</td><td>' + c.candidates + '</td><td>' + c.promoted + '</td><td>' + c.unconfirmed + '</td><td>' + fmtMinutes(c.avgLeadMinutes) + '</td></tr>'
+      ).join('') : '<tr><td colspan="5" class="empty">No data yet.</td></tr>';
+
+      const recentTbody = document.getElementById('recent-tbody');
+      recentTbody.innerHTML = data.recent.length ? data.recent.map(r =>
+        '<tr><td>' + esc(r.species) + '</td><td>' + esc(r.county) + '</td><td>' + esc(r.date) + '</td><td>' + esc(r.status) + '</td>' +
+        '<td>' + (r.confirmed ? '<span class="badge promoted">Promoted</span>' : '<span class="badge unconfirmed">Unconfirmed</span>') + '</td>' +
+        '<td>' + fmtMinutes(r.leadMinutes) + '</td></tr>'
+      ).join('') : '<tr><td colspan="6" class="empty">No candidates yet.</td></tr>';
+    }
+
+    loadStats();
   </script>`, true));
 });
 
