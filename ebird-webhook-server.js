@@ -107,8 +107,39 @@ db.serialize(() => {
       media_photos INTEGER DEFAULT 0,
       media_audio INTEGER DEFAULT 0,
       media_video INTEGER DEFAULT 0,
+      source TEXT DEFAULT 'notable',
+      confirmed INTEGER DEFAULT 1,
+      fast_pass_flagged_at DATETIME,
+      confirmed_at DATETIME,
       scrape_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(sub_id, species_code)
+    )
+  `);
+
+  // Add columns to pre-existing DBs that predate the fast-pass feature.
+  db.all(`PRAGMA table_info(observations)`, (err, columns) => {
+    if (err) return console.error('Failed to inspect observations schema:', err);
+    const names = columns.map(c => c.name);
+    if (!names.includes('source')) {
+      db.run(`ALTER TABLE observations ADD COLUMN source TEXT DEFAULT 'notable'`);
+    }
+    if (!names.includes('confirmed')) {
+      db.run(`ALTER TABLE observations ADD COLUMN confirmed INTEGER DEFAULT 1`);
+    }
+    if (!names.includes('fast_pass_flagged_at')) {
+      db.run(`ALTER TABLE observations ADD COLUMN fast_pass_flagged_at DATETIME`);
+    }
+    if (!names.includes('confirmed_at')) {
+      db.run(`ALTER TABLE observations ADD COLUMN confirmed_at DATETIME`);
+    }
+  });
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS county_species (
+      county TEXT NOT NULL,
+      species_code TEXT NOT NULL,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(county, species_code)
     )
   `);
 
@@ -140,11 +171,24 @@ db.serialize(() => {
         media_photos INTEGER DEFAULT 0,
         media_audio INTEGER DEFAULT 0,
         media_video INTEGER DEFAULT 0,
+        source TEXT DEFAULT 'notable',
+        confirmed INTEGER DEFAULT 1,
+        fast_pass_flagged_at DATETIME,
+        confirmed_at DATETIME,
         scrape_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(sub_id, species_code)
       )
     `);
-    db.run(`INSERT OR IGNORE INTO observations SELECT * FROM observations_old`);
+    db.run(`
+      INSERT OR IGNORE INTO observations
+      (id, county, species, species_code, scientific_name, location, location_id, date, observer,
+       count, lat, lng, reviewed, valid, status, sub_id, obs_id, species_comment, checklist_comment,
+       media_photos, media_audio, media_video, scrape_timestamp)
+      SELECT id, county, species, species_code, scientific_name, location, location_id, date, observer,
+       count, lat, lng, reviewed, valid, status, sub_id, obs_id, species_comment, checklist_comment,
+       media_photos, media_audio, media_video, scrape_timestamp
+      FROM observations_old
+    `);
     db.run(`DROP TABLE observations_old`);
     console.log('Migration complete.');
   });
@@ -271,6 +315,126 @@ async function scrapeAllCounties() {
   return allObservations;
 }
 
+// Per-county set of species codes ever reported there (from eBird's own spplist),
+// used as a cheap "is this expected at all" baseline for the fast pass. Not a
+// substitute for eBird's real notable/rarity filters — just a coarse pre-filter.
+const expectedSpeciesCache = {};
+
+function loadExpectedSpeciesCacheFromDB() {
+  return new Promise((resolve, reject) => {
+    db.all('SELECT county, species_code FROM county_species', (err, rows) => {
+      if (err) return reject(err);
+      for (const row of rows) {
+        if (!expectedSpeciesCache[row.county]) expectedSpeciesCache[row.county] = new Set();
+        expectedSpeciesCache[row.county].add(row.species_code);
+      }
+      resolve();
+    });
+  });
+}
+
+// Refresh each county's all-time species list from eBird. Species lists change
+// slowly (new county records are rare), so this only needs to run daily.
+async function refreshCountySpeciesList() {
+  const apiKey = process.env.EBIRD_API_KEY;
+  if (!apiKey) throw new Error('EBIRD_API_KEY is not set');
+
+  for (const [county, regionCode] of Object.entries(njCounties)) {
+    try {
+      const response = await axios.get(`https://api.ebird.org/v2/product/spplist/${regionCode}`, {
+        headers: { 'X-eBirdApiToken': apiKey },
+        timeout: 15000
+      });
+      const codes = response.data;
+      expectedSpeciesCache[county] = new Set(codes);
+
+      await new Promise((resolve, reject) => {
+        db.serialize(() => {
+          db.run('DELETE FROM county_species WHERE county = ?', [county]);
+          const stmt = db.prepare('INSERT OR IGNORE INTO county_species (county, species_code) VALUES (?, ?)');
+          codes.forEach(code => stmt.run([county, code]));
+          stmt.finalize(err => (err ? reject(err) : resolve()));
+        });
+      });
+      console.log(`✓ Species baseline refreshed for ${county}: ${codes.length} species`);
+    } catch (error) {
+      console.error(`✗ Failed to refresh species baseline for ${county}:`, error.message);
+    }
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
+}
+
+// NJ's local calendar date (checklists are dated locally; using UTC could be off by a day)
+function getNJDateParts() {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', year: 'numeric', month: 'numeric', day: 'numeric'
+  }).formatToParts(new Date());
+  const map = {};
+  for (const p of parts) map[p.type] = p.value;
+  return { y: map.year, m: map.month, d: map.day };
+}
+
+// Fetch every observation reported today for a county, regardless of eBird's
+// notable classification — this is what makes the fast pass fast, since new
+// checklists show up here within minutes of submission.
+async function fetchCountyHistoricToday(county, regionCode) {
+  const apiKey = process.env.EBIRD_API_KEY;
+  if (!apiKey) throw new Error('EBIRD_API_KEY is not set');
+
+  const { y, m, d } = getNJDateParts();
+  const url = `https://api.ebird.org/v2/data/obs/${regionCode}/historic/${y}/${m}/${d}`;
+  const response = await axios.get(url, {
+    headers: { 'X-eBirdApiToken': apiKey },
+    params: { detail: 'full' },
+    timeout: 15000
+  });
+
+  return response.data.map(obs => ({
+    county,
+    species: obs.comName,
+    speciesCode: obs.speciesCode,
+    scientificName: obs.sciName,
+    location: obs.locName,
+    locationId: obs.locId,
+    date: obs.obsDt,
+    observer: obs.userDisplayName || 'Unknown',
+    count: obs.howMany || null,
+    lat: obs.lat,
+    lng: obs.lng,
+    reviewed: obs.obsReviewed,
+    valid: obs.obsValid,
+    status: obs.obsReviewed ? (obs.obsValid ? 'Confirmed' : 'Not Accepted') : 'Unreviewed',
+    subId: obs.subId || null
+  }));
+}
+
+// Scan today's observations across all NJ counties and return only the ones
+// for species not on that county's known-species baseline — rough rarity
+// candidates the slower official notable pass will later confirm or dismiss.
+async function scrapeFastPassCandidates() {
+  const candidates = [];
+
+  for (const [county, regionCode] of Object.entries(njCounties)) {
+    const expected = expectedSpeciesCache[county];
+    if (!expected || expected.size === 0) {
+      console.warn(`Fast pass: no species baseline for ${county} yet, skipping`);
+      await new Promise(resolve => setTimeout(resolve, 200));
+      continue;
+    }
+    try {
+      const observations = await fetchCountyHistoricToday(county, regionCode);
+      const unexpected = observations.filter(o => o.speciesCode && !expected.has(o.speciesCode));
+      candidates.push(...unexpected);
+      console.log(`✓ Fast pass ${county}: ${unexpected.length} unexpected of ${observations.length} total`);
+    } catch (error) {
+      console.error(`✗ Fast pass error fetching ${county}:`, error.message);
+    }
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
+
+  return candidates;
+}
+
 // Fetch a single checklist's details
 async function fetchChecklistDetails(subId) {
   const response = await axios.get(`https://api.ebird.org/v2/product/checklist/view/${subId}`, {
@@ -339,14 +503,47 @@ async function storeObservations(observations) {
   const existingObservations = observations.filter(o => existing.has(`${o.subId}:${o.speciesCode}`));
 
   if (existingObservations.length > 0) {
+    // Look up prior state so we can log the fast-pass-to-confirmed lead time
+    // (see below) — the UPDATE below only has access to the OLD row's values
+    // via SQL CASE expressions, not something we can compute a JS delta from.
+    const priorState = await new Promise((resolve, reject) => {
+      const clause = existingObservations.map(() => '(sub_id = ? AND species_code = ?)').join(' OR ');
+      const params = existingObservations.flatMap(o => [o.subId, o.speciesCode]);
+      db.all(
+        `SELECT sub_id, species_code, confirmed, fast_pass_flagged_at FROM observations WHERE ${clause}`,
+        params,
+        (err, rows) => {
+          if (err) return reject(err);
+          resolve(new Map(rows.map(r => [`${r.sub_id}:${r.species_code}`, r])));
+        }
+      );
+    });
+
+    // A later notable-pass sighting of something the fast pass already flagged
+    // promotes it to confirmed and refreshes its review status, without
+    // duplicating the record or re-notifying.
     await new Promise((resolve, reject) => {
       const stmt = db.prepare(`
-        UPDATE observations SET media_photos = ?, media_audio = ?, media_video = ?
+        UPDATE observations SET media_photos = ?, media_audio = ?, media_video = ?,
+          confirmed = CASE WHEN ? = 'notable' THEN 1 ELSE confirmed END,
+          confirmed_at = CASE WHEN ? = 'notable' AND confirmed = 0 THEN CURRENT_TIMESTAMP ELSE confirmed_at END,
+          reviewed = CASE WHEN ? = 'notable' THEN ? ELSE reviewed END,
+          valid = CASE WHEN ? = 'notable' THEN ? ELSE valid END,
+          status = CASE WHEN ? = 'notable' THEN ? ELSE status END
         WHERE sub_id = ? AND species_code = ?
       `);
       existingObservations.forEach(obs => {
+        const prior = priorState.get(`${obs.subId}:${obs.speciesCode}`);
+        if (obs.source === 'notable' && prior && prior.confirmed === 0 && prior.fast_pass_flagged_at) {
+          const leadMinutes = Math.round((Date.now() - new Date(prior.fast_pass_flagged_at).getTime()) / 60000);
+          console.log(`⚡→✓ Fast-pass candidate confirmed by notable pass: ${obs.species} (${obs.county}), ${leadMinutes} min lead time`);
+        }
         stmt.run(
-          [obs.mediaPhotos || 0, obs.mediaAudio || 0, obs.mediaVideo || 0, obs.subId, obs.speciesCode],
+          [obs.mediaPhotos || 0, obs.mediaAudio || 0, obs.mediaVideo || 0,
+           obs.source, obs.source, obs.source, obs.reviewed ? 1 : 0,
+           obs.source, obs.valid ? 1 : 0,
+           obs.source, obs.status,
+           obs.subId, obs.speciesCode],
           err => { if (err) console.error('DB update error:', err); }
         );
       });
@@ -361,17 +558,22 @@ async function storeObservations(observations) {
       INSERT OR IGNORE INTO observations
       (county, species, species_code, scientific_name, location, location_id, date, observer,
        count, lat, lng, reviewed, valid, status,
-       sub_id, obs_id, species_comment, checklist_comment, media_photos, media_audio, media_video)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       sub_id, obs_id, species_comment, checklist_comment, media_photos, media_audio, media_video,
+       source, confirmed, fast_pass_flagged_at, confirmed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     newObservations.forEach(obs => {
+      const isUnconfirmedFast = obs.source === 'fast' && !obs.confirmed;
+      const now = new Date().toISOString();
       stmt.run(
         [obs.county, obs.species, obs.speciesCode || null, obs.scientificName,
          obs.location, obs.locationId, obs.date, obs.observer,
          obs.count, obs.lat, obs.lng, obs.reviewed ? 1 : 0, obs.valid ? 1 : 0, obs.status,
          obs.subId || null, obs.obsId || null, obs.speciesComment || null, obs.checklistComment || null,
-         obs.mediaPhotos || 0, obs.mediaAudio || 0, obs.mediaVideo || 0],
+         obs.mediaPhotos || 0, obs.mediaAudio || 0, obs.mediaVideo || 0,
+         obs.source || 'notable', isUnconfirmedFast ? 0 : 1,
+         obs.source === 'fast' ? now : null, isUnconfirmedFast ? null : now],
         err => { if (err) console.error('DB insert error:', err); }
       );
     });
@@ -432,7 +634,8 @@ async function sendWebhookNotifications(observations) {
 // Build a Discord embed for a single observation
 function buildEmbed(obs) {
   const colors = { 'Confirmed': 0x2d6a4f, 'Unreviewed': 0xf0a500, 'Not Accepted': 0xc0392b };
-  const color = colors[obs.status] || 0x888888;
+  const isUnconfirmedFast = obs.source === 'fast' && !obs.confirmed;
+  const color = isUnconfirmedFast ? 0x8e44ad : (colors[obs.status] || 0x888888);
 
   const fields = [
     { name: 'County',   value: obs.county,            inline: true },
@@ -441,6 +644,7 @@ function buildEmbed(obs) {
     { name: 'Observer', value: obs.observer,           inline: true },
     { name: 'Count',    value: obs.count != null ? String(obs.count) : '—', inline: true },
     { name: 'Status',   value: obs.status || 'Unknown', inline: true },
+    { name: 'Source',   value: isUnconfirmedFast ? '⚡ Fast pass (unconfirmed)' : '✓ eBird notable', inline: true },
   ];
 
   const mediaParts = [];
@@ -500,8 +704,10 @@ async function sendDiscordNotifications(newObservations) {
 }
 
 let scrapeRunning = false;
+let fastPassRunning = false;
 
-// Main scrape and notify function
+// Main scrape and notify function — the authoritative pass, driven by eBird's
+// own notable/rarity filters. Runs on the hour.
 async function runDailyUpdate() {
   if (scrapeRunning) {
     console.log('Scrape already in progress, skipping.');
@@ -509,13 +715,14 @@ async function runDailyUpdate() {
   }
   scrapeRunning = true;
   console.log(`\n[${new Date().toISOString()}] Starting daily eBird alert scrape...`);
-  
+
   try {
     const observations = await scrapeAllCounties();
     console.log(`Found ${observations.length} observations — fetching checklist details...`);
 
     const enriched = await enrichWithChecklistDetails(observations);
-    const newObs = await storeObservations(enriched);
+    const tagged = enriched.map(o => ({ ...o, source: 'notable', confirmed: true }));
+    const newObs = await storeObservations(tagged);
     console.log(`Stored ${newObs.length} new observations`);
 
     if (newObs.length > 0) {
@@ -526,6 +733,45 @@ async function runDailyUpdate() {
     console.error('Error during daily update:', error);
   } finally {
     scrapeRunning = false;
+  }
+}
+
+// Fast pass — runs at the half-hour mark, well ahead of the next notable pass.
+// Uses today's raw checklist observations (available within minutes of
+// submission) filtered against each county's known-species baseline, so it
+// can flag likely rarities before eBird's own notable classification catches
+// up. Anything it misses is still caught by the next runDailyUpdate — delayed,
+// not missed. Anything it flags gets promoted to confirmed once the notable
+// pass corroborates it (see storeObservations).
+async function runFastPass() {
+  if (fastPassRunning) {
+    console.log('Fast pass already in progress, skipping.');
+    return;
+  }
+  if (scrapeRunning) {
+    console.log('Notable scrape in progress, skipping fast pass this cycle.');
+    return;
+  }
+  fastPassRunning = true;
+  console.log(`\n[${new Date().toISOString()}] Starting fast-pass checklist scrape...`);
+
+  try {
+    const candidates = await scrapeFastPassCandidates();
+    console.log(`Fast pass found ${candidates.length} unexpected-species candidates — fetching checklist details...`);
+
+    const enriched = await enrichWithChecklistDetails(candidates);
+    const tagged = enriched.map(o => ({ ...o, source: 'fast', confirmed: false }));
+    const newObs = await storeObservations(tagged);
+    console.log(`Fast pass stored ${newObs.length} new candidate observations`);
+
+    if (newObs.length > 0) {
+      await sendWebhookNotifications(newObs);
+      await sendDiscordNotifications(newObs);
+    }
+  } catch (error) {
+    console.error('Error during fast pass:', error);
+  } finally {
+    fastPassRunning = false;
   }
 }
 
@@ -694,6 +940,7 @@ function pageShell(title, activeHref, bodyHtml, authenticated) {
     <nav>
       <a href="/" ${activeHref === '/' ? 'class="active"' : ''}>Observations</a>
       ${authenticated ? `<a href="/settings" ${activeHref === '/settings' ? 'class="active"' : ''}>Discord Webhooks</a>` : ''}
+      ${authenticated ? `<a href="/stats" ${activeHref === '/stats' ? 'class="active"' : ''}>Fast-Pass Stats</a>` : ''}
     </nav>
     ${authenticated ? `<form method="POST" action="/logout" style="margin:0"><button type="submit" style="background:none;border:1px solid rgba(255,255,255,0.3);color:#e2e8f0;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:0.8rem">Logout</button></form>` : ''}
   </header>
@@ -819,6 +1066,139 @@ app.get('/settings', requireAuth, async (req, res) => {
   </script>`, true));
 });
 
+// Fast-pass efficacy stats — aggregated over the full lifetime of the
+// observations table (fast_pass_flagged_at/confirmed_at never get cleared),
+// so this reflects how the feature has performed since it was deployed,
+// not just a recent window.
+app.get('/stats/fast-pass', requireAuth, (req, res) => {
+  const totalsSql = `
+    SELECT
+      MIN(fast_pass_flagged_at) AS since,
+      COUNT(*) AS candidates,
+      SUM(CASE WHEN confirmed = 1 THEN 1 ELSE 0 END) AS promoted,
+      SUM(CASE WHEN confirmed = 0 THEN 1 ELSE 0 END) AS unconfirmed,
+      AVG(CASE WHEN confirmed_at IS NOT NULL
+            THEN (julianday(confirmed_at) - julianday(fast_pass_flagged_at)) * 1440
+            ELSE NULL END) AS avgLeadMinutes
+    FROM observations WHERE source = 'fast'
+  `;
+  const byCountySql = `
+    SELECT
+      county,
+      COUNT(*) AS candidates,
+      SUM(CASE WHEN confirmed = 1 THEN 1 ELSE 0 END) AS promoted,
+      SUM(CASE WHEN confirmed = 0 THEN 1 ELSE 0 END) AS unconfirmed,
+      AVG(CASE WHEN confirmed_at IS NOT NULL
+            THEN (julianday(confirmed_at) - julianday(fast_pass_flagged_at)) * 1440
+            ELSE NULL END) AS avgLeadMinutes
+    FROM observations WHERE source = 'fast'
+    GROUP BY county ORDER BY candidates DESC
+  `;
+  const recentSql = `
+    SELECT species, county, date, status, confirmed, fast_pass_flagged_at AS flaggedAt, confirmed_at AS confirmedAt
+    FROM observations WHERE source = 'fast'
+    ORDER BY fast_pass_flagged_at DESC LIMIT 50
+  `;
+
+  db.get(totalsSql, [], (err, totals) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    db.all(byCountySql, [], (err, byCounty) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      db.all(recentSql, [], (err, recent) => {
+        if (err) return res.status(500).json({ error: 'Database error' });
+        const withLead = recent.map(r => ({
+          ...r,
+          leadMinutes: r.confirmedAt
+            ? Math.round((new Date(r.confirmedAt).getTime() - new Date(r.flaggedAt).getTime()) / 60000)
+            : null
+        }));
+        res.json({ totals, byCounty, recent: withLead });
+      });
+    });
+  });
+});
+
+// Fast-pass stats admin page
+app.get('/stats', requireAuth, (req, res) => {
+  res.send(pageShell('Fast-Pass Stats', '/stats', `
+  <style>
+    .page { max-width: 1000px; margin: 32px auto; padding: 0 24px; }
+    h2 { font-size: 1.1rem; font-weight: 600; margin: 24px 0 12px; color: #2d6a4f; }
+    h2:first-child { margin-top: 0; }
+    .cards { display: flex; gap: 16px; flex-wrap: wrap; }
+    .card { background: white; border-radius: 6px; padding: 16px 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); min-width: 140px; }
+    .card .num { font-size: 1.6rem; font-weight: 700; color: #1b4332; }
+    .card .label { font-size: 0.8rem; color: #666; margin-top: 4px; }
+    .since { font-size: 0.85rem; color: #666; margin-bottom: 16px; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.875rem; background: white; border-radius: 6px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+    thead th { background: #2d6a4f; color: white; text-align: left; padding: 8px 12px; }
+    tbody tr { border-bottom: 1px solid #eee; }
+    tbody tr:hover { background: #f9f9f9; }
+    td { padding: 8px 12px; }
+    .badge { padding: 2px 8px; border-radius: 10px; font-size: 0.75rem; font-weight: 600; }
+    .badge.promoted { background: #e8f5e9; color: #1b4332; }
+    .badge.unconfirmed { background: #f3e5f5; color: #6a1b9a; }
+    .empty { padding: 32px; text-align: center; color: #888; }
+  </style>
+  <div class="page">
+    <h2>Overview</h2>
+    <div class="since" id="since"></div>
+    <div class="cards" id="cards"></div>
+
+    <h2>By County</h2>
+    <table>
+      <thead><tr><th>County</th><th>Candidates</th><th>Promoted</th><th>Unconfirmed</th><th>Avg Lead Time</th></tr></thead>
+      <tbody id="county-tbody"><tr><td colspan="5" class="empty">Loading...</td></tr></tbody>
+    </table>
+
+    <h2>Recent Candidates</h2>
+    <table>
+      <thead><tr><th>Species</th><th>County</th><th>Date</th><th>Status</th><th>Outcome</th><th>Lead Time</th></tr></thead>
+      <tbody id="recent-tbody"><tr><td colspan="6" class="empty">Loading...</td></tr></tbody>
+    </table>
+  </div>
+  <script>
+    function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+    function fmtMinutes(m) {
+      if (m == null) return '—';
+      if (m < 60) return m + ' min';
+      return (m / 60).toFixed(1) + ' hr';
+    }
+
+    async function loadStats() {
+      const data = await (await fetch('/stats/fast-pass')).json();
+      const t = data.totals;
+
+      document.getElementById('since').textContent = t.since
+        ? 'Tracking since ' + new Date(t.since).toLocaleDateString()
+        : 'No fast-pass candidates recorded yet.';
+
+      const rate = t.candidates ? Math.round((t.promoted / t.candidates) * 100) : 0;
+      document.getElementById('cards').innerHTML = [
+        ['Total Candidates', t.candidates || 0],
+        ['Promoted', t.promoted || 0],
+        ['Still Unconfirmed', t.unconfirmed || 0],
+        ['Promotion Rate', rate + '%'],
+        ['Avg Lead Time', fmtMinutes(t.avgLeadMinutes)]
+      ].map(([label, num]) => '<div class="card"><div class="num">' + num + '</div><div class="label">' + label + '</div></div>').join('');
+
+      const countyTbody = document.getElementById('county-tbody');
+      countyTbody.innerHTML = data.byCounty.length ? data.byCounty.map(c =>
+        '<tr><td>' + esc(c.county) + '</td><td>' + c.candidates + '</td><td>' + c.promoted + '</td><td>' + c.unconfirmed + '</td><td>' + fmtMinutes(c.avgLeadMinutes) + '</td></tr>'
+      ).join('') : '<tr><td colspan="5" class="empty">No data yet.</td></tr>';
+
+      const recentTbody = document.getElementById('recent-tbody');
+      recentTbody.innerHTML = data.recent.length ? data.recent.map(r =>
+        '<tr><td>' + esc(r.species) + '</td><td>' + esc(r.county) + '</td><td>' + esc(r.date) + '</td><td>' + esc(r.status) + '</td>' +
+        '<td>' + (r.confirmed ? '<span class="badge promoted">Promoted</span>' : '<span class="badge unconfirmed">Unconfirmed</span>') + '</td>' +
+        '<td>' + fmtMinutes(r.leadMinutes) + '</td></tr>'
+      ).join('') : '<tr><td colspan="6" class="empty">No candidates yet.</td></tr>';
+    }
+
+    loadStats();
+  </script>`, true));
+});
+
 // Observations browser UI
 app.get('/', (req, res) => {
   const authenticated = !!req.session.authenticated;
@@ -852,6 +1232,9 @@ app.get('/', (req, res) => {
     .badge.confirmed { background: #d4edda; color: #155724; }
     .badge.unreviewed { background: #fff3cd; color: #856404; }
     .badge.not-accepted { background: #f8d7da; color: #721c24; }
+    .badge.fast-unconfirmed { background: #f3e5f5; color: #6a1b9a; }
+    .badge.fast-confirmed { background: #e8f5e9; color: #1b4332; }
+    .badge.source-ebird { background: #e3f2fd; color: #0d47a1; }
     .empty { text-align: center; padding: 48px; color: #888; }
     .table-wrap { overflow-x: auto; }
     a.map-link { color: #2d6a4f; text-decoration: none; font-size: 0.8rem; }
@@ -893,6 +1276,7 @@ app.get('/', (req, res) => {
     </label>
     <button onclick="loadObservations()">Filter</button>
     ${authenticated ? `<button class="secondary" onclick="triggerScrape()">Fetch now</button>` : ''}
+    ${authenticated ? `<button class="secondary" onclick="triggerFastPass()">Fast pass now</button>` : ''}
   </div>
   <div id="status">Loading...</div>
   <div class="table-wrap">
@@ -906,6 +1290,7 @@ app.get('/', (req, res) => {
           <th data-col="observer">Observer</th>
           <th data-col="count">Count</th>
           <th data-col="status">Status</th>
+          <th data-col="source">Source</th>
           <th>Notes &amp; Media</th>
         </tr>
       </thead>
@@ -1050,7 +1435,7 @@ app.get('/', (req, res) => {
       rows = sorted;
       const tbody = document.getElementById('obs-body');
       if (rows.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="8" class="empty">No observations found for the selected filters.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="9" class="empty">No observations found for the selected filters.</td></tr>';
         return;
       }
       tbody.innerHTML = rows.map(r => {
@@ -1079,6 +1464,12 @@ app.get('/', (req, res) => {
           ? '<div class="media-links">' + mediaLinks.join('') + '</div>'
           : '';
 
+        const sourceBadge = r.source === 'fast'
+          ? (r.confirmed
+              ? '<span class="badge fast-confirmed" title="Flagged by the fast pass, since confirmed by eBird notable feed">⚡ Fast (confirmed)</span>'
+              : '<span class="badge fast-unconfirmed" title="Flagged by the fast pass; eBird notable feed has not corroborated it yet">⚡ Fast (unconfirmed)</span>')
+          : '<span class="badge source-ebird" title="From eBird notable/rarity feed">eBird notable</span>';
+
         return '<tr>' +
           '<td class="species">' + escHtml(r.species) + '<br><span class="sci">' + escHtml(r.scientific_name || '') + '</span></td>' +
           '<td>' + escHtml(r.county) + '</td>' +
@@ -1087,6 +1478,7 @@ app.get('/', (req, res) => {
           '<td>' + escHtml(r.observer) + '</td>' +
           '<td>' + (r.count != null ? r.count : '—') + '</td>' +
           '<td><span class="badge ' + badgeClass + '">' + escHtml(r.status) + '</span></td>' +
+          '<td>' + sourceBadge + '</td>' +
           '<td>' + comment + mediaCell + '</td>' +
           '</tr>';
       }).join('');
@@ -1109,6 +1501,19 @@ app.get('/', (req, res) => {
       }
     }
 
+    async function triggerFastPass() {
+      const status = document.getElementById('status');
+      status.textContent = 'Running fast pass...';
+      try {
+        await fetch('/scrape-fast-now', { method: 'POST' });
+        status.textContent = 'Fast pass started — reloading in 20 seconds...';
+        setTimeout(loadObservations, 20000);
+      } catch (e) {
+        status.className = 'error';
+        status.textContent = 'Error triggering fast pass: ' + e.message;
+      }
+    }
+
     document.getElementById('species-input').addEventListener('change', addSpeciesFromInput);
     document.getElementById('species-input').addEventListener('keydown', e => {
       if (e.key === 'Enter') { e.preventDefault(); addSpeciesFromInput(); }
@@ -1128,18 +1533,32 @@ app.post('/scrape-now', requireAuth, async (req, res) => {
   runDailyUpdate().catch(console.error);
 });
 
+// Manually trigger a fast pass (for testing)
+app.post('/scrape-fast-now', requireAuth, async (req, res) => {
+  res.json({ message: 'Fast pass started in background' });
+  runFastPass().catch(console.error);
+});
+
 // Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Schedule daily scrape at 6 AM
+// Authoritative notable-based scrape, on the hour
 cron.schedule('0 * * * *', () => {
   runDailyUpdate();
 });
 
-// Run startup scrape (secrets are already loaded at this point)
-setTimeout(() => runDailyUpdate(), 5000);
+// Fast pass, at the half-hour mark — a quick pre-filter that the next
+// hourly pass above double-checks and confirms
+cron.schedule('30 * * * *', () => {
+  runFastPass();
+});
+
+// Refresh each county's known-species baseline once a day
+cron.schedule('15 3 * * *', () => {
+  refreshCountySpeciesList();
+});
 
 // Start server
 const PORT = process.env.PORT || 3000;
@@ -1150,6 +1569,18 @@ app.listen(PORT, () => {
   console.log(`Get observations: GET /observations`);
   console.log(`Get counties: GET /counties`);
 });
+
+// Make sure a species baseline exists, then run startup scrape.
+// Runs in the background so /health responds as soon as the server is
+// listening, without waiting on eBird's spplist calls for all 21 counties.
+(async () => {
+  await loadExpectedSpeciesCacheFromDB();
+  if (Object.keys(expectedSpeciesCache).length === 0) {
+    console.log('No species baseline found — building one from eBird before first run...');
+    await refreshCountySpeciesList();
+  }
+  setTimeout(() => runDailyUpdate(), 5000);
+})().catch(err => console.error('Startup background task failed:', err));
 
 // Graceful shutdown
 process.on('SIGINT', () => {
