@@ -109,12 +109,14 @@ db.serialize(() => {
       media_video INTEGER DEFAULT 0,
       source TEXT DEFAULT 'notable',
       confirmed INTEGER DEFAULT 1,
+      fast_pass_flagged_at DATETIME,
+      confirmed_at DATETIME,
       scrape_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(sub_id, species_code)
     )
   `);
 
-  // Add source/confirmed to pre-existing DBs that predate the fast-pass feature.
+  // Add columns to pre-existing DBs that predate the fast-pass feature.
   db.all(`PRAGMA table_info(observations)`, (err, columns) => {
     if (err) return console.error('Failed to inspect observations schema:', err);
     const names = columns.map(c => c.name);
@@ -123,6 +125,12 @@ db.serialize(() => {
     }
     if (!names.includes('confirmed')) {
       db.run(`ALTER TABLE observations ADD COLUMN confirmed INTEGER DEFAULT 1`);
+    }
+    if (!names.includes('fast_pass_flagged_at')) {
+      db.run(`ALTER TABLE observations ADD COLUMN fast_pass_flagged_at DATETIME`);
+    }
+    if (!names.includes('confirmed_at')) {
+      db.run(`ALTER TABLE observations ADD COLUMN confirmed_at DATETIME`);
     }
   });
 
@@ -165,6 +173,8 @@ db.serialize(() => {
         media_video INTEGER DEFAULT 0,
         source TEXT DEFAULT 'notable',
         confirmed INTEGER DEFAULT 1,
+        fast_pass_flagged_at DATETIME,
+        confirmed_at DATETIME,
         scrape_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(sub_id, species_code)
       )
@@ -493,6 +503,22 @@ async function storeObservations(observations) {
   const existingObservations = observations.filter(o => existing.has(`${o.subId}:${o.speciesCode}`));
 
   if (existingObservations.length > 0) {
+    // Look up prior state so we can log the fast-pass-to-confirmed lead time
+    // (see below) — the UPDATE below only has access to the OLD row's values
+    // via SQL CASE expressions, not something we can compute a JS delta from.
+    const priorState = await new Promise((resolve, reject) => {
+      const clause = existingObservations.map(() => '(sub_id = ? AND species_code = ?)').join(' OR ');
+      const params = existingObservations.flatMap(o => [o.subId, o.speciesCode]);
+      db.all(
+        `SELECT sub_id, species_code, confirmed, fast_pass_flagged_at FROM observations WHERE ${clause}`,
+        params,
+        (err, rows) => {
+          if (err) return reject(err);
+          resolve(new Map(rows.map(r => [`${r.sub_id}:${r.species_code}`, r])));
+        }
+      );
+    });
+
     // A later notable-pass sighting of something the fast pass already flagged
     // promotes it to confirmed and refreshes its review status, without
     // duplicating the record or re-notifying.
@@ -500,17 +526,23 @@ async function storeObservations(observations) {
       const stmt = db.prepare(`
         UPDATE observations SET media_photos = ?, media_audio = ?, media_video = ?,
           confirmed = CASE WHEN ? = 'notable' THEN 1 ELSE confirmed END,
+          confirmed_at = CASE WHEN ? = 'notable' AND confirmed = 0 THEN CURRENT_TIMESTAMP ELSE confirmed_at END,
           reviewed = CASE WHEN ? = 'notable' THEN ? ELSE reviewed END,
           valid = CASE WHEN ? = 'notable' THEN ? ELSE valid END,
           status = CASE WHEN ? = 'notable' THEN ? ELSE status END
         WHERE sub_id = ? AND species_code = ?
       `);
       existingObservations.forEach(obs => {
+        const prior = priorState.get(`${obs.subId}:${obs.speciesCode}`);
+        if (obs.source === 'notable' && prior && prior.confirmed === 0 && prior.fast_pass_flagged_at) {
+          const leadMinutes = Math.round((Date.now() - new Date(prior.fast_pass_flagged_at).getTime()) / 60000);
+          console.log(`⚡→✓ Fast-pass candidate confirmed by notable pass: ${obs.species} (${obs.county}), ${leadMinutes} min lead time`);
+        }
         stmt.run(
           [obs.mediaPhotos || 0, obs.mediaAudio || 0, obs.mediaVideo || 0,
-           obs.source, obs.source, obs.reviewed ? 1 : 0,
-           obs.source, obs.source, obs.valid ? 1 : 0,
-           obs.source, obs.source, obs.status,
+           obs.source, obs.source, obs.source, obs.reviewed ? 1 : 0,
+           obs.source, obs.valid ? 1 : 0,
+           obs.source, obs.status,
            obs.subId, obs.speciesCode],
           err => { if (err) console.error('DB update error:', err); }
         );
@@ -527,18 +559,21 @@ async function storeObservations(observations) {
       (county, species, species_code, scientific_name, location, location_id, date, observer,
        count, lat, lng, reviewed, valid, status,
        sub_id, obs_id, species_comment, checklist_comment, media_photos, media_audio, media_video,
-       source, confirmed)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       source, confirmed, fast_pass_flagged_at, confirmed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     newObservations.forEach(obs => {
+      const isUnconfirmedFast = obs.source === 'fast' && !obs.confirmed;
+      const now = new Date().toISOString();
       stmt.run(
         [obs.county, obs.species, obs.speciesCode || null, obs.scientificName,
          obs.location, obs.locationId, obs.date, obs.observer,
          obs.count, obs.lat, obs.lng, obs.reviewed ? 1 : 0, obs.valid ? 1 : 0, obs.status,
          obs.subId || null, obs.obsId || null, obs.speciesComment || null, obs.checklistComment || null,
          obs.mediaPhotos || 0, obs.mediaAudio || 0, obs.mediaVideo || 0,
-         obs.source || 'notable', (obs.source === 'fast' && !obs.confirmed) ? 0 : 1],
+         obs.source || 'notable', isUnconfirmedFast ? 0 : 1,
+         obs.source === 'fast' ? now : null, isUnconfirmedFast ? null : now],
         err => { if (err) console.error('DB insert error:', err); }
       );
     });
