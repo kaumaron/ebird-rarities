@@ -138,10 +138,27 @@ db.serialize(() => {
     CREATE TABLE IF NOT EXISTS county_species (
       county TEXT NOT NULL,
       species_code TEXT NOT NULL,
+      species TEXT,
+      scientific_name TEXT,
+      last_seen_date TEXT,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(county, species_code)
     )
   `);
+
+  db.all(`PRAGMA table_info(county_species)`, (err, columns) => {
+    if (err) return console.error('Failed to inspect county_species schema:', err);
+    const names = columns.map(c => c.name);
+    if (!names.includes('species')) {
+      db.run(`ALTER TABLE county_species ADD COLUMN species TEXT`);
+    }
+    if (!names.includes('scientific_name')) {
+      db.run(`ALTER TABLE county_species ADD COLUMN scientific_name TEXT`);
+    }
+    if (!names.includes('last_seen_date')) {
+      db.run(`ALTER TABLE county_species ADD COLUMN last_seen_date TEXT`);
+    }
+  });
 
   db.get(`SELECT sql FROM sqlite_master WHERE type='table' AND name='observations'`, (err, row) => {
     if (!row || !row.sql || row.sql.includes('UNIQUE(sub_id, species_code)')) return;
@@ -315,9 +332,16 @@ async function scrapeAllCounties() {
   return allObservations;
 }
 
-// Per-county set of species codes ever reported there (from eBird's own spplist),
-// used as a cheap "is this expected at all" baseline for the fast pass. Not a
-// substitute for eBird's real notable/rarity filters — just a coarse pre-filter.
+// Per-county set of species codes seen there in the last RECENCY_WINDOW_DAYS,
+// used as the fast pass's "is this expected right now" baseline. We tried an
+// all-time baseline (eBird's spplist) first, but in a well-birded state like
+// NJ almost every notable rarity has occurred at least once historically in
+// a given county, so "never recorded here" essentially never fired — see
+// the /stats findings from the first week of production. A recency window
+// tracks actual seasonal turnover instead, at the cost of flagging ordinary
+// first-of-season arrivals as candidates too (an accepted trade-off — FOY
+// birds are a welcome alert, not just noise).
+const RECENCY_WINDOW_DAYS = 30; // eBird's recent-observations endpoint caps "back" at 30
 const expectedSpeciesCache = {};
 
 function loadExpectedSpeciesCacheFromDB() {
@@ -333,30 +357,45 @@ function loadExpectedSpeciesCacheFromDB() {
   });
 }
 
-// Refresh each county's all-time species list from eBird. Species lists change
-// slowly (new county records are rare), so this only needs to run daily.
+// Refresh each county's "seen in the last RECENCY_WINDOW_DAYS" species baseline
+// from eBird. Recent activity shifts day to day as migration progresses, so
+// this needs to run daily to stay current (unlike the old all-time list, which
+// barely changed).
 async function refreshCountySpeciesList() {
   const apiKey = process.env.EBIRD_API_KEY;
   if (!apiKey) throw new Error('EBIRD_API_KEY is not set');
 
   for (const [county, regionCode] of Object.entries(njCounties)) {
     try {
-      const response = await axios.get(`https://api.ebird.org/v2/product/spplist/${regionCode}`, {
+      const response = await axios.get(`https://api.ebird.org/v2/data/obs/${regionCode}/recent`, {
         headers: { 'X-eBirdApiToken': apiKey },
+        params: { back: RECENCY_WINDOW_DAYS },
         timeout: 15000
       });
-      const codes = response.data;
-      expectedSpeciesCache[county] = new Set(codes);
+
+      // The endpoint already returns one entry per species (most recent
+      // sighting) but we dedupe defensively rather than assume that holds.
+      const bySpecies = new Map();
+      for (const obs of response.data) {
+        if (!obs.speciesCode) continue;
+        const existing = bySpecies.get(obs.speciesCode);
+        if (!existing || obs.obsDt > existing.obsDt) bySpecies.set(obs.speciesCode, obs);
+      }
+      const speciesRows = [...bySpecies.values()];
+      expectedSpeciesCache[county] = new Set(speciesRows.map(o => o.speciesCode));
 
       await new Promise((resolve, reject) => {
         db.serialize(() => {
           db.run('DELETE FROM county_species WHERE county = ?', [county]);
-          const stmt = db.prepare('INSERT OR IGNORE INTO county_species (county, species_code) VALUES (?, ?)');
-          codes.forEach(code => stmt.run([county, code]));
+          const stmt = db.prepare(`
+            INSERT OR IGNORE INTO county_species (county, species_code, species, scientific_name, last_seen_date)
+            VALUES (?, ?, ?, ?, ?)
+          `);
+          speciesRows.forEach(o => stmt.run([county, o.speciesCode, o.comName, o.sciName, o.obsDt]));
           stmt.finalize(err => (err ? reject(err) : resolve()));
         });
       });
-      console.log(`✓ Species baseline refreshed for ${county}: ${codes.length} species`);
+      console.log(`✓ Species baseline refreshed for ${county}: ${speciesRows.length} species (last ${RECENCY_WINDOW_DAYS} days)`);
     } catch (error) {
       console.error(`✗ Failed to refresh species baseline for ${county}:`, error.message);
     }
@@ -883,6 +922,124 @@ app.get('/species', (req, res) => {
   });
 });
 
+// Public: the recency-based "what's expected right now" baseline the fast
+// pass compares against, exposed for anyone to sanity-check — e.g. to see
+// why a given species was or wasn't flagged as a candidate for their county.
+app.get('/baseline/data', (req, res) => {
+  const { county } = req.query;
+  let query = 'SELECT county, species_code, species, scientific_name, last_seen_date, updated_at FROM county_species';
+  const params = [];
+  if (county) {
+    query += ' WHERE county = ?';
+    params.push(county);
+  }
+  query += ' ORDER BY county, species';
+  db.all(query, params, (err, rows) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    res.json({ windowDays: RECENCY_WINDOW_DAYS, rows });
+  });
+});
+
+app.get('/baseline', (req, res) => {
+  res.send(pageShell('Rarity Baseline', '/baseline', `
+  <style>
+    .page { max-width: 1000px; margin: 32px auto; padding: 0 24px; }
+    .intro { background: white; border-radius: 6px; padding: 16px 20px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); font-size: 0.9rem; color: #444; line-height: 1.5; }
+    .controls { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
+    .controls select, .controls input { padding: 7px 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 0.9rem; }
+    .controls input { width: 220px; }
+    .count { font-size: 0.85rem; color: #666; margin-left: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.875rem; background: white; border-radius: 6px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+    thead th { background: #2d6a4f; color: white; text-align: left; padding: 8px 12px; cursor: pointer; user-select: none; }
+    tbody tr { border-bottom: 1px solid #eee; }
+    tbody tr:hover { background: #f9f9f9; }
+    td { padding: 8px 12px; }
+    .sci { color: #888; font-style: italic; font-size: 0.82em; }
+    .empty { padding: 32px; text-align: center; color: #888; }
+  </style>
+  <div class="page">
+    <div class="intro">
+      This is the "seen recently" baseline the fast pass compares each new checklist against:
+      a species not on its county's list here gets flagged as a rarity candidate.
+      The list covers the last <span id="window-days">30</span> days per county and refreshes daily —
+      it's not a list of rare birds, it's a list of what's <em>not</em> unusual right now.
+    </div>
+    <div class="controls">
+      <select id="county-filter"><option value="">All counties</option></select>
+      <input id="species-filter" type="text" placeholder="Filter by species name...">
+      <span class="count" id="count"></span>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th data-col="county">County</th>
+          <th data-col="species">Species</th>
+          <th data-col="last_seen_date">Last Seen</th>
+          <th data-col="updated_at">Baseline Updated</th>
+        </tr>
+      </thead>
+      <tbody id="baseline-tbody"><tr><td colspan="4" class="empty">Loading...</td></tr></tbody>
+    </table>
+  </div>
+  <script>
+    function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+    let allRows = [];
+    let sortCol = 'county', sortDir = 1;
+
+    function render() {
+      const countyVal = document.getElementById('county-filter').value;
+      const speciesVal = document.getElementById('species-filter').value.trim().toLowerCase();
+      let rows = allRows.filter(r =>
+        (!countyVal || r.county === countyVal) &&
+        (!speciesVal || (r.species || '').toLowerCase().includes(speciesVal))
+      );
+      rows.sort((a, b) => {
+        const av = a[sortCol] || '', bv = b[sortCol] || '';
+        return av < bv ? -1 * sortDir : av > bv ? 1 * sortDir : 0;
+      });
+      document.getElementById('count').textContent = rows.length + ' species';
+      const tbody = document.getElementById('baseline-tbody');
+      if (!rows.length) {
+        tbody.innerHTML = '<tr><td colspan="4" class="empty">No baseline data yet.</td></tr>';
+        return;
+      }
+      tbody.innerHTML = rows.map(r =>
+        '<tr><td>' + esc(r.county) + '</td>' +
+        '<td>' + esc(r.species || r.species_code) + (r.scientific_name ? '<br><span class="sci">' + esc(r.scientific_name) + '</span>' : '') + '</td>' +
+        '<td>' + esc(r.last_seen_date || '—') + '</td>' +
+        '<td>' + esc(r.updated_at || '—') + '</td></tr>'
+      ).join('');
+    }
+
+    document.querySelectorAll('th[data-col]').forEach(th => {
+      th.addEventListener('click', () => {
+        const col = th.dataset.col;
+        sortDir = (sortCol === col) ? -sortDir : 1;
+        sortCol = col;
+        render();
+      });
+    });
+
+    async function init() {
+      const counties = await (await fetch('/counties')).json();
+      const sel = document.getElementById('county-filter');
+      counties.forEach(c => {
+        const o = document.createElement('option'); o.value = c; o.textContent = c; sel.appendChild(o);
+      });
+
+      const data = await (await fetch('/baseline/data')).json();
+      document.getElementById('window-days').textContent = data.windowDays;
+      allRows = data.rows;
+      render();
+    }
+
+    document.getElementById('county-filter').addEventListener('change', render);
+    document.getElementById('species-filter').addEventListener('input', render);
+    init();
+  </script>`, !!req.session.authenticated));
+});
+
 // List Discord webhooks
 app.get('/discord-webhooks', requireAuth, (req, res) => {
   db.all('SELECT * FROM discord_webhooks ORDER BY county, name', (err, rows) => {
@@ -939,6 +1096,7 @@ function pageShell(title, activeHref, bodyHtml, authenticated) {
     <span id="last-updated" style="font-size:0.8rem;opacity:0.7;margin-left:12px"></span>
     <nav>
       <a href="/" ${activeHref === '/' ? 'class="active"' : ''}>Observations</a>
+      <a href="/baseline" ${activeHref === '/baseline' ? 'class="active"' : ''}>Rarity Baseline</a>
       ${authenticated ? `<a href="/settings" ${activeHref === '/settings' ? 'class="active"' : ''}>Discord Webhooks</a>` : ''}
       ${authenticated ? `<a href="/stats" ${activeHref === '/stats' ? 'class="active"' : ''}>Fast-Pass Stats</a>` : ''}
     </nav>
@@ -1575,8 +1733,23 @@ app.listen(PORT, () => {
 // listening, without waiting on eBird's spplist calls for all 21 counties.
 (async () => {
   await loadExpectedSpeciesCacheFromDB();
+
+  // Rows from the old all-time baseline (pre-recency-window) never had a
+  // species name populated — a non-empty cache alone doesn't mean it's
+  // current, since a deploy can change what "the baseline" means without
+  // the table ever going empty.
+  const staleCount = await new Promise((resolve, reject) => {
+    db.get('SELECT COUNT(*) AS c FROM county_species WHERE species IS NULL', (err, row) => {
+      if (err) return reject(err);
+      resolve(row.c);
+    });
+  });
+
   if (Object.keys(expectedSpeciesCache).length === 0) {
     console.log('No species baseline found — building one from eBird before first run...');
+    await refreshCountySpeciesList();
+  } else if (staleCount > 0) {
+    console.log(`Found ${staleCount} stale (pre-recency-window) baseline rows — rebuilding...`);
     await refreshCountySpeciesList();
   }
   setTimeout(() => runDailyUpdate(), 5000);
