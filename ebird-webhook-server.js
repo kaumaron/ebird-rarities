@@ -160,6 +160,53 @@ db.serialize(() => {
     }
   });
 
+  // Species eBird's own notable/rarity filter has ever flagged in a county.
+  // Unlike county_species (a rolling 30-day window that "forgets" a rarity
+  // the day after it reappears), this never expires a species on its own —
+  // it's the source of truth for "is this genuinely rare here," independent
+  // of whether it happens to have been seen recently.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS rare_species_registry (
+      county TEXT NOT NULL,
+      species_code TEXT NOT NULL,
+      species TEXT,
+      scientific_name TEXT,
+      first_flagged_at DATETIME,
+      last_flagged_at DATETIME,
+      UNIQUE(county, species_code)
+    )
+  `);
+
+  // One row per species seen in a county on a given calendar day, kept
+  // indefinitely (never overwritten like county_species is) — the raw
+  // material for a future frequency-based rarity score. Populated both by
+  // the daily species-baseline refresh (going forward) and by the backfill
+  // job below (filling in the historical gap before this table existed).
+  db.run(`
+    CREATE TABLE IF NOT EXISTS county_species_daily (
+      county TEXT NOT NULL,
+      species_code TEXT NOT NULL,
+      seen_date TEXT NOT NULL,
+      species TEXT,
+      scientific_name TEXT,
+      UNIQUE(county, species_code, seen_date)
+    )
+  `);
+
+  // Single-row cursor for the slow historical backfill of county_species_daily.
+  // Walks backwards day by day across all counties, a small batch at a time,
+  // so it never competes meaningfully with the hourly/half-hourly scrapes.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS backfill_progress (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      day_offset INTEGER NOT NULL DEFAULT 1,
+      county_idx INTEGER NOT NULL DEFAULT 0,
+      done INTEGER NOT NULL DEFAULT 0,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  db.run(`INSERT OR IGNORE INTO backfill_progress (id, day_offset, county_idx, done) VALUES (1, 1, 0, 0)`);
+
   db.get(`SELECT sql FROM sqlite_master WHERE type='table' AND name='observations'`, (err, row) => {
     if (!row || !row.sql || row.sql.includes('UNIQUE(sub_id, species_code)')) return;
     console.log('Migrating observations table to new unique constraint...');
@@ -357,6 +404,42 @@ function loadExpectedSpeciesCacheFromDB() {
   });
 }
 
+// Per-county set of species codes eBird's own notable pass has ever flagged.
+// Mirrors rare_species_registry; used to keep a species a fast-pass candidate
+// even after it drops back onto the county_species recency baseline (a
+// species doesn't stop being rare just because it was seen again yesterday).
+const rareSpeciesCache = {};
+
+function loadRareSpeciesCacheFromDB() {
+  return new Promise((resolve, reject) => {
+    db.all('SELECT county, species_code FROM rare_species_registry', (err, rows) => {
+      if (err) return reject(err);
+      for (const row of rows) {
+        if (!rareSpeciesCache[row.county]) rareSpeciesCache[row.county] = new Set();
+        rareSpeciesCache[row.county].add(row.species_code);
+      }
+      resolve();
+    });
+  });
+}
+
+// Record that eBird's notable pass flagged this species in this county —
+// called for every 'notable'-sourced observation storeObservations sees,
+// whether newly inserted or a re-seen row. Upsert keeps first/last flagged
+// timestamps without duplicating rows across repeat sightings.
+function recordNotableSighting(obs) {
+  if (!obs.speciesCode) return;
+  if (!rareSpeciesCache[obs.county]) rareSpeciesCache[obs.county] = new Set();
+  rareSpeciesCache[obs.county].add(obs.speciesCode);
+  db.run(
+    `INSERT INTO rare_species_registry (county, species_code, species, scientific_name, first_flagged_at, last_flagged_at)
+     VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+     ON CONFLICT(county, species_code) DO UPDATE SET last_flagged_at = CURRENT_TIMESTAMP`,
+    [obs.county, obs.speciesCode, obs.species, obs.scientificName],
+    err => { if (err) console.error('Failed to record notable species:', err.message); }
+  );
+}
+
 // Refresh each county's "seen in the last RECENCY_WINDOW_DAYS" species baseline
 // from eBird. Recent activity shifts day to day as migration progresses, so
 // this needs to run daily to stay current (unlike the old all-time list, which
@@ -395,6 +478,21 @@ async function refreshCountySpeciesList() {
           stmt.finalize(err => (err ? reject(err) : resolve()));
         });
       });
+
+      // Also drop each species' most-recent-sighting date into the
+      // never-overwritten daily history, a free complement to the backfill
+      // job below — this call only ever gives us "latest date per species,"
+      // not every day it occurred, but accumulated day over day it builds
+      // toward the same frequency data the backfill is filling in for the past.
+      await new Promise((resolve, reject) => {
+        const stmt = db.prepare(`
+          INSERT OR IGNORE INTO county_species_daily (county, species_code, seen_date, species, scientific_name)
+          VALUES (?, ?, ?, ?, ?)
+        `);
+        speciesRows.forEach(o => stmt.run([county, o.speciesCode, (o.obsDt || '').split(' ')[0], o.comName, o.sciName]));
+        stmt.finalize(err => (err ? reject(err) : resolve()));
+      });
+
       console.log(`✓ Species baseline refreshed for ${county}: ${speciesRows.length} species (last ${RECENCY_WINDOW_DAYS} days)`);
     } catch (error) {
       console.error(`✗ Failed to refresh species baseline for ${county}:`, error.message);
@@ -447,6 +545,118 @@ async function fetchCountyHistoricToday(county, regionCode) {
   }));
 }
 
+// Fetch raw observations for an arbitrary past date — used only by the
+// backfill job, so unlike fetchCountyHistoricToday this skips `detail: full`
+// (we only need species codes, not comments/media) to keep each request light.
+async function fetchCountyHistoricForDate(county, regionCode, y, m, d) {
+  const apiKey = process.env.EBIRD_API_KEY;
+  if (!apiKey) throw new Error('EBIRD_API_KEY is not set');
+
+  const url = `https://api.ebird.org/v2/data/obs/${regionCode}/historic/${y}/${m}/${d}`;
+  const response = await axios.get(url, {
+    headers: { 'X-eBirdApiToken': apiKey },
+    timeout: 15000
+  });
+  return response.data;
+}
+
+// --- Backfill job (option C groundwork) ---------------------------------
+// Slowly walks backwards day by day, county by county, populating
+// county_species_daily with historical species-per-day data so that once
+// enough history accrues we can score rarity by actual frequency instead of
+// the 30-day recency heuristic. Paced deliberately slowly (a handful of
+// requests per tick, a tick every few minutes) so it never meaningfully
+// competes with the hourly notable pass or half-hourly fast pass for API
+// headroom. Progress is persisted in backfill_progress so a restart resumes
+// instead of starting over.
+const BACKFILL_DAYS = parseInt(process.env.BACKFILL_DAYS || '365', 10);
+const BACKFILL_BATCH_SIZE = parseInt(process.env.BACKFILL_BATCH_SIZE || '5', 10);
+
+// Approximates the NJ-local calendar date N days ago. Computed by shifting
+// the UTC instant and re-formatting in the NJ timezone, which can be off by
+// a day right around midnight — acceptable here since this only feeds a
+// day-granularity frequency score, not anything timing-sensitive.
+function njDateNDaysAgo(n) {
+  const shifted = new Date(Date.now() - n * 24 * 60 * 60 * 1000);
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', year: 'numeric', month: 'numeric', day: 'numeric'
+  }).formatToParts(shifted);
+  const map = {};
+  for (const p of parts) map[p.type] = p.value;
+  return { y: map.year, m: map.month, d: map.day };
+}
+
+let backfillRunning = false;
+
+async function runBackfillTick() {
+  if (backfillRunning) return;
+  backfillRunning = true;
+  try {
+    const progress = await new Promise((resolve, reject) => {
+      db.get('SELECT * FROM backfill_progress WHERE id = 1', (err, row) => (err ? reject(err) : resolve(row)));
+    });
+    if (!progress || progress.done) return;
+
+    const countyKeys = Object.keys(njCounties);
+    let dayOffset = progress.day_offset;
+    let countyIdx = progress.county_idx;
+
+    for (let i = 0; i < BACKFILL_BATCH_SIZE; i++) {
+      if (dayOffset > BACKFILL_DAYS) {
+        await new Promise((resolve, reject) => {
+          db.run('UPDATE backfill_progress SET done = 1, updated_at = CURRENT_TIMESTAMP WHERE id = 1',
+            err => (err ? reject(err) : resolve()));
+        });
+        console.log(`Backfill complete: ${BACKFILL_DAYS} days across ${countyKeys.length} counties.`);
+        break;
+      }
+
+      const county = countyKeys[countyIdx];
+      const regionCode = njCounties[county];
+      const { y, m, d } = njDateNDaysAgo(dayOffset);
+      const seenDate = `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+
+      try {
+        const observations = await fetchCountyHistoricForDate(county, regionCode, y, m, d);
+        const bySpecies = new Map();
+        for (const obs of observations) {
+          if (obs.speciesCode && !bySpecies.has(obs.speciesCode)) bySpecies.set(obs.speciesCode, obs);
+        }
+        await new Promise((resolve, reject) => {
+          db.serialize(() => {
+            const stmt = db.prepare(`
+              INSERT OR IGNORE INTO county_species_daily (county, species_code, seen_date, species, scientific_name)
+              VALUES (?, ?, ?, ?, ?)
+            `);
+            for (const obs of bySpecies.values()) {
+              stmt.run([county, obs.speciesCode, seenDate, obs.comName, obs.sciName]);
+            }
+            stmt.finalize(err => (err ? reject(err) : resolve()));
+          });
+        });
+        console.log(`✓ Backfill ${county} ${seenDate} (day -${dayOffset}): ${bySpecies.size} species`);
+      } catch (error) {
+        console.error(`✗ Backfill error ${county} ${seenDate}:`, error.message);
+      }
+
+      countyIdx++;
+      if (countyIdx >= countyKeys.length) {
+        countyIdx = 0;
+        dayOffset++;
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+
+    await new Promise((resolve, reject) => {
+      db.run('UPDATE backfill_progress SET day_offset = ?, county_idx = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1',
+        [dayOffset, countyIdx], err => (err ? reject(err) : resolve()));
+    });
+  } finally {
+    backfillRunning = false;
+  }
+}
+
 // Scan today's observations across all NJ counties and return only the ones
 // for species not on that county's known-species baseline — rough rarity
 // candidates the slower official notable pass will later confirm or dismiss.
@@ -460,9 +670,12 @@ async function scrapeFastPassCandidates() {
       await new Promise(resolve => setTimeout(resolve, 200));
       continue;
     }
+    const rare = rareSpeciesCache[county];
     try {
       const observations = await fetchCountyHistoricToday(county, regionCode);
-      const unexpected = observations.filter(o => o.speciesCode && !expected.has(o.speciesCode));
+      const unexpected = observations.filter(o =>
+        o.speciesCode && (!expected.has(o.speciesCode) || (rare && rare.has(o.speciesCode)))
+      );
       candidates.push(...unexpected);
       console.log(`✓ Fast pass ${county}: ${unexpected.length} unexpected of ${observations.length} total`);
     } catch (error) {
@@ -577,6 +790,7 @@ async function storeObservations(observations) {
           const leadMinutes = Math.round((Date.now() - new Date(prior.fast_pass_flagged_at).getTime()) / 60000);
           console.log(`⚡→✓ Fast-pass candidate confirmed by notable pass: ${obs.species} (${obs.county}), ${leadMinutes} min lead time`);
         }
+        if (obs.source === 'notable') recordNotableSighting(obs);
         stmt.run(
           [obs.mediaPhotos || 0, obs.mediaAudio || 0, obs.mediaVideo || 0,
            obs.source, obs.source, obs.source, obs.reviewed ? 1 : 0,
@@ -605,6 +819,7 @@ async function storeObservations(observations) {
     newObservations.forEach(obs => {
       const isUnconfirmedFast = obs.source === 'fast' && !obs.confirmed;
       const now = new Date().toISOString();
+      if (obs.source === 'notable') recordNotableSighting(obs);
       stmt.run(
         [obs.county, obs.species, obs.speciesCode || null, obs.scientificName,
          obs.location, obs.locationId, obs.date, obs.observer,
@@ -1718,6 +1933,14 @@ cron.schedule('15 3 * * *', () => {
   refreshCountySpeciesList();
 });
 
+// Historical backfill for county_species_daily — a handful of requests every
+// few minutes, deliberately slow so it doesn't compete with the passes above.
+// At the defaults (5 requests / 5 min, 21 counties x 365 days) this takes
+// roughly 5-6 days to complete; tune via BACKFILL_BATCH_SIZE / env.
+cron.schedule('*/5 * * * *', () => {
+  runBackfillTick().catch(err => console.error('Backfill tick failed:', err));
+});
+
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
@@ -1733,6 +1956,7 @@ app.listen(PORT, () => {
 // listening, without waiting on eBird's spplist calls for all 21 counties.
 (async () => {
   await loadExpectedSpeciesCacheFromDB();
+  await loadRareSpeciesCacheFromDB();
 
   // Rows from the old all-time baseline (pre-recency-window) never had a
   // species name populated — a non-empty cache alone doesn't mean it's
