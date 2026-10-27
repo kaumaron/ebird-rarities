@@ -391,6 +391,17 @@ async function scrapeAllCounties() {
 const RECENCY_WINDOW_DAYS = 30; // eBird's recent-observations endpoint caps "back" at 30
 const expectedSpeciesCache = {};
 
+// Species permanently excluded from fast-pass candidacy, regardless of
+// recency/rarity-registry state — species where the candidate signal itself
+// is unreliable rather than just noisy.
+//   rocpig (Rock Pigeon): most NJ birds are the feral/domestic form, which
+//   eBird expects reporters to log as "Rock Pigeon (Feral)" rather than
+//   the wild/vagrant "Rock Pigeon" form. In practice many birders don't
+//   make that distinction and log ordinary feral pigeons as the vagrant
+//   form, which the vagrant form's absence-based novelty check can't tell
+//   apart from a real one — producing persistent false-positive candidates.
+const FAST_PASS_EXCLUDED_SPECIES = new Set(['rocpig']);
+
 function loadExpectedSpeciesCacheFromDB() {
   return new Promise((resolve, reject) => {
     db.all('SELECT county, species_code FROM county_species', (err, rows) => {
@@ -674,7 +685,8 @@ async function scrapeFastPassCandidates() {
     try {
       const observations = await fetchCountyHistoricToday(county, regionCode);
       const unexpected = observations.filter(o =>
-        o.speciesCode && (!expected.has(o.speciesCode) || (rare && rare.has(o.speciesCode)))
+        o.speciesCode && !FAST_PASS_EXCLUDED_SPECIES.has(o.speciesCode) &&
+        (!expected.has(o.speciesCode) || (rare && rare.has(o.speciesCode)))
       );
       candidates.push(...unexpected);
       console.log(`✓ Fast pass ${county}: ${unexpected.length} unexpected of ${observations.length} total`);
@@ -1922,9 +1934,11 @@ cron.schedule('0 * * * *', () => {
   runDailyUpdate();
 });
 
-// Fast pass, at the half-hour mark — a quick pre-filter that the next
-// hourly pass above double-checks and confirms
-cron.schedule('30 * * * *', () => {
+// Fast pass, every 15 minutes — a quick pre-filter that the next hourly
+// pass above double-checks and confirms. One of these four runs lands on
+// the hour alongside the notable pass; runFastPass's scrapeRunning guard
+// just skips that cycle rather than racing it.
+cron.schedule('*/15 * * * *', () => {
   runFastPass();
 });
 
