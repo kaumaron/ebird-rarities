@@ -451,6 +451,56 @@ function recordNotableSighting(obs) {
   );
 }
 
+// How far back county_species_daily frequency is computed over, and how
+// rare a species' share of observed days has to be to count as a candidate
+// on frequency grounds alone. Both tunable via env.
+const FREQUENCY_WINDOW_DAYS = parseInt(process.env.FREQUENCY_WINDOW_DAYS || '365', 10);
+const FREQUENCY_RARE_THRESHOLD = parseFloat(process.env.FREQUENCY_RARE_THRESHOLD || '0.05');
+// Below this many distinct observed days in the window, a county's frequency
+// data is too thin to trust (early backfill, or a gap in daily refreshes) —
+// scrapeFastPassCandidates falls back to the plain recency check instead.
+const MIN_DAYS_FOR_FREQUENCY = parseInt(process.env.MIN_DAYS_FOR_FREQUENCY || '90', 10);
+
+// Per-county: { daysObserved, frequencies: Map(speciesCode -> daysSeen / daysObserved) },
+// built from county_species_daily (the backfill's output). Unlike the 30-day
+// recency baseline, this measures how often a species actually shows up in a
+// county over a full year, so a reliable seasonal migrant (e.g. a sparrow
+// that arrives every October) scores as common even on the day it first
+// reappears, while a species seen only a handful of times all year scores as
+// rare even if last week's sighting is still inside the 30-day window.
+const speciesFrequencyCache = {};
+
+async function refreshSpeciesFrequencyCache() {
+  const cutoff = new Date(Date.now() - FREQUENCY_WINDOW_DAYS * 24 * 60 * 60 * 1000)
+    .toISOString().split('T')[0];
+
+  for (const county of Object.keys(njCounties)) {
+    const daysObserved = await new Promise((resolve, reject) => {
+      db.get(
+        'SELECT COUNT(DISTINCT seen_date) AS c FROM county_species_daily WHERE county = ? AND seen_date >= ?',
+        [county, cutoff],
+        (err, row) => (err ? reject(err) : resolve(row.c))
+      );
+    });
+    const rows = await new Promise((resolve, reject) => {
+      db.all(
+        `SELECT species_code, COUNT(DISTINCT seen_date) AS daysSeen
+         FROM county_species_daily WHERE county = ? AND seen_date >= ?
+         GROUP BY species_code`,
+        [county, cutoff],
+        (err, rows) => (err ? reject(err) : resolve(rows))
+      );
+    });
+
+    const frequencies = new Map();
+    if (daysObserved > 0) {
+      for (const row of rows) frequencies.set(row.species_code, row.daysSeen / daysObserved);
+    }
+    speciesFrequencyCache[county] = { daysObserved, frequencies };
+  }
+  console.log('✓ Species frequency cache refreshed from county_species_daily');
+}
+
 // Refresh each county's "seen in the last RECENCY_WINDOW_DAYS" species baseline
 // from eBird. Recent activity shifts day to day as migration progresses, so
 // this needs to run daily to stay current (unlike the old all-time list, which
@@ -668,9 +718,28 @@ async function runBackfillTick() {
   }
 }
 
-// Scan today's observations across all NJ counties and return only the ones
-// for species not on that county's known-species baseline — rough rarity
-// candidates the slower official notable pass will later confirm or dismiss.
+// Scan today's observations across all NJ counties and return the ones that
+// look like rarity candidates for the slower official notable pass to later
+// confirm or dismiss. A species is a candidate if:
+//   - eBird's own notable pass has flagged it in this county before, OR
+//   - county_species_daily has enough history to trust a frequency score,
+//     and that score is below FREQUENCY_RARE_THRESHOLD (rare on a whole-year
+//     basis, regardless of whether it happens to be inside the 30-day
+//     recency window right now — this is what lets a reliable October
+//     migrant stop being flagged every single year), OR
+//   - there isn't enough frequency history yet to trust that score, in which
+//     case we fall back to the original recency-absence check.
+function isFastPassCandidate(county, speciesCode, expected, rare, freqInfo) {
+  if (!speciesCode || FAST_PASS_EXCLUDED_SPECIES.has(speciesCode)) return false;
+  if (rare && rare.has(speciesCode)) return true;
+
+  if (freqInfo && freqInfo.daysObserved >= MIN_DAYS_FOR_FREQUENCY) {
+    const freq = freqInfo.frequencies.get(speciesCode) || 0;
+    return freq < FREQUENCY_RARE_THRESHOLD;
+  }
+  return !expected.has(speciesCode);
+}
+
 async function scrapeFastPassCandidates() {
   const candidates = [];
 
@@ -682,11 +751,11 @@ async function scrapeFastPassCandidates() {
       continue;
     }
     const rare = rareSpeciesCache[county];
+    const freqInfo = speciesFrequencyCache[county];
     try {
       const observations = await fetchCountyHistoricToday(county, regionCode);
       const unexpected = observations.filter(o =>
-        o.speciesCode && !FAST_PASS_EXCLUDED_SPECIES.has(o.speciesCode) &&
-        (!expected.has(o.speciesCode) || (rare && rare.has(o.speciesCode)))
+        isFastPassCandidate(county, o.speciesCode, expected, rare, freqInfo)
       );
       candidates.push(...unexpected);
       console.log(`✓ Fast pass ${county}: ${unexpected.length} unexpected of ${observations.length} total`);
@@ -1947,6 +2016,13 @@ cron.schedule('15 3 * * *', () => {
   refreshCountySpeciesList();
 });
 
+// Recompute frequency scores from county_species_daily once a day — the
+// underlying data only changes a day at a time, so there's no reason to
+// recompute more often than that.
+cron.schedule('30 3 * * *', () => {
+  refreshSpeciesFrequencyCache().catch(err => console.error('Frequency cache refresh failed:', err));
+});
+
 // Historical backfill for county_species_daily — a handful of requests every
 // few minutes, deliberately slow so it doesn't compete with the passes above.
 // At the defaults (5 requests / 5 min, 21 counties x 365 days) this takes
@@ -1971,6 +2047,7 @@ app.listen(PORT, () => {
 (async () => {
   await loadExpectedSpeciesCacheFromDB();
   await loadRareSpeciesCacheFromDB();
+  await refreshSpeciesFrequencyCache();
 
   // Rows from the old all-time baseline (pre-recency-window) never had a
   // species name populated — a non-empty cache alone doesn't mean it's
